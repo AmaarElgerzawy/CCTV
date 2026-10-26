@@ -77,14 +77,20 @@ directly.
 
 ```powershell
 python test_dvr.py
+python test_dvr.py --verify-logout
 ```
 
 Expected output is `Login: OK`, a `Device info:` JSON object containing the four
-device fields plus `succeeded_calls`/`failed_calls`, then
-`Logout: local session cleared`. The four values are non-sensitive; credentials,
-session ids, and any `get2DCode` value are never printed. A failed call is
-isolated so the other three still run, and failure entries contain only the
-method name and error code.
+device fields plus `succeeded_calls`/`failed_calls`, and
+`Logout: server-side logout succeeded`. The four values are non-sensitive;
+credentials, session ids, and any `get2DCode` value are never printed. A failed
+call is isolated so the other three still run, and failure entries contain only
+the method name and error code.
+
+With `--verify-logout`, the client logs out and then makes exactly one
+`global.keepAlive` request with the old session. It reports whether that session
+was rejected (closed), was still accepted, or could not be determined. No retry
+is made.
 
 You can also check the web API directly:
 
@@ -106,9 +112,10 @@ This is a liveness check only; it does not contact the DVR.
 ### `GET /api/device/info`
 
 Opens a new `DvrClient`, logs in, calls the four device-identity methods, and
-clears the local session on exit (server-side logout is not documented; see the
-TODO list below). Each call is isolated so one failure does not stop the others.
-No session state is shared between requests.
+calls `global.logout` in a `finally` block. The local session is cleared even if
+the logout call fails; a logout failure is logged with a safe diagnostic and
+does not include response values. Each device call is isolated so one failure
+does not stop the others. No session state is shared between requests.
 
 ```json
 {
@@ -139,14 +146,19 @@ includes the password, session id, or raw DVR payload.
   never logged or returned by an endpoint.
 - Each `/api/device/info` request creates and closes its own client, which keeps
   the door open for the later multi-device, on-demand architecture.
-- This phase is read-only. No configuration write/set calls exist in the code.
+- The endpoint and context manager call `logout()` in a `finally` block, so the
+  local session is cleared even when an earlier call fails.
+- This phase is read-only except for session logout. No configuration write/set
+  calls exist in the code.
 
-## Confirmed by `api_spec.md`
+## Confirmed by `api_spec.md` and `har_summary.txt`
 
 - JSON-RPC login: `POST /RPC2_Login` with `rpc=global.login`.
 - Post-login calls: `POST /RPC2`, including the `session` value in the request
   and a `session` value in responses.
 - A successful login response contains a top-level `session`.
+- Logout: `POST /RPC2` with `rpc=global.logout`, returning response keys
+  `id`, `result`, `session`. The capture does not record the request body.
 - Keepalive: `global.keepAlive`, with `params.timeout` in the response.
 - Device type: `magicBox.getDeviceType`, with the result in `params.type`.
 - Device class: `magicBox.getDeviceClass`, with the result in `params.type`.
@@ -169,11 +181,14 @@ includes the password, session id, or raw DVR payload.
    this flow sends neither. There is exactly one attempt per step and no
    automatic retry. See the `TODO(spec)` comments in `DvrClient.login()` and
    `_hash_password()`.
-2. **Logout.** The spec explicitly says logout was not observed. There is no
-   confirmed method or endpoint, so `logout()` only clears the local session;
-   it makes no invented server call. The DVR will expire the session after its
-   keepalive timeout. Add the confirmed logout RPC to `DvrClient.logout()` once
-   it is known.
+2. **Logout request body.** The capture confirms `POST /RPC2 rpc=global.logout`
+   and response keys `id`, `result`, `session`, but not the request body.
+   `logout()` sends the current session in the top-level `session` field, a
+   fresh `id`, and `params: null` as the smallest assumption. It adds no other
+   fields. Success means `result` is `true`; the local session is always cleared.
+   A failed logout raises a safe `DvrLogoutError` with method, HTTP status, error
+   code/message, and result type only. The optional verification uses one
+   `global.keepAlive` request with the old session and never retries.
 3. **Device call request shapes.** `api_spec.md` and `har_summary.txt` show
    `magicBox.getProductDefinition name=BuildDate`, so that call sends
    `params.name = "BuildDate"`. Neither source shows request parameters for

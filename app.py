@@ -10,6 +10,7 @@ from dvr_client import (
     DvrClient,
     DvrConfigError,
     DvrError,
+    DvrLogoutError,
     DvrRpcError,
     DvrSessionExpired,
 )
@@ -35,11 +36,12 @@ def health() -> dict[str, str]:
 
 @app.get("/api/device/info")
 def device_info() -> JSONResponse:
+    client: DvrClient | None = None
     try:
         # One client per request: no global session state is kept.
-        with DvrClient.from_env() as client:
-            client.login()
-            info = client.get_device_info()
+        client = DvrClient.from_env()
+        client.login()
+        info = client.get_device_info()
     except DvrConfigError as exc:
         logger.error("DVR is not configured: %s", exc)
         return _error(
@@ -62,6 +64,14 @@ def device_info() -> JSONResponse:
         # Log the type only; exception strings can contain upstream data.
         logger.error("Unexpected error while reading DVR info: %s", type(exc).__name__)
         return _error(500, "Unexpected server error.")
+    finally:
+        if client is not None:
+            try:
+                client.logout()
+            except DvrLogoutError as exc:
+                logger.warning("DVR logout failed: %s", exc)
+            finally:
+                client.close()
 
     return JSONResponse({"info": info})
 

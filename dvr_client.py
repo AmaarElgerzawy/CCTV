@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 
 _RPC2_PATH = "/RPC2"
 _LOGIN_PATH = "/RPC2_Login"
+_LOGOUT_METHOD = "global.logout"
+_LOGOUT_PROBE_METHOD = "global.keepAlive"
 
 # TODO(spec): api_spec.md confirms POST /RPC2_Login rpc=global.login and its
 # response fields, but not the request-side credential fields or their values.
@@ -74,6 +76,21 @@ class DvrRpcError(DvrError):
         self.status = status
         self.code = _error_code(payload)
         super().__init__(_rpc_diagnostic(method, status, payload))
+
+
+class DvrLogoutError(DvrError):
+    """The DVR rejected global.logout or the call did not complete."""
+
+    def __init__(
+        self,
+        method: str,
+        status: int | None,
+        payload: dict[str, Any],
+    ) -> None:
+        self.method = method
+        self.status = status
+        self.code = _error_code(payload)
+        super().__init__(_logout_diagnostic(method, status, payload))
 
 
 class _DvrHttpError(DvrError):
@@ -159,6 +176,23 @@ def _rpc_diagnostic(method: str, status: int, payload: dict[str, Any]) -> str:
         f"{text}; result: {_result_type(payload)}; "
         f"params.info: {_info_type(payload)}; response keys: {keys}"
     )
+
+
+def _logout_diagnostic(
+    method: str, status: int | None, payload: dict[str, Any]
+) -> str:
+    """Describe a logout failure using only safe, non-response fields."""
+    code = _error_code(payload)
+    message = _error_message(payload)
+
+    parts = [f"DVR RPC {method} failed"]
+    parts.append(f"HTTP {status}" if status is not None else "no HTTP response")
+    if code is not None:
+        parts.append(f"code {code}")
+    text = f"{parts[0]} ({', '.join(parts[1:])})"
+    if message:
+        text += f": {message}"
+    return f"{text}; result: {_result_type(payload)}"
 
 
 # TODO(spec): api_spec.md does not mark which methods return data. The methods
@@ -287,10 +321,16 @@ class DvrClient:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         try:
-            self.logout()
+            return False
         finally:
-            self.close()
-        return False
+            try:
+                self.logout()
+            except DvrLogoutError:
+                # Do not mask an exception raised by the with-body.
+                if exc_type is None:
+                    raise
+            finally:
+                self.close()
 
     def __repr__(self) -> str:
         return f"DvrClient(base_url={str(self._http.base_url).rstrip('/')!r})"
@@ -424,15 +464,72 @@ class DvrClient:
 
         return info
 
-    def logout(self) -> None:
-        """Forget the local session.
+    def _probe_closed_session(self, session: str) -> bool | None:
+        """Check whether the DVR rejects an old session.
 
-        TODO(spec): api_spec.md states that a logout request was not observed
-        and that the logout method/endpoint is unknown. No server-side logout
-        call is made here, because guessing a method name would violate the
-        spec. The DVR will expire the session after its keepAlive timeout.
+        Returns True when rejected, False when still accepted, and None when
+        the result is inconclusive. This makes exactly one request and never
+        retries.
         """
-        self._session_id = None
+        try:
+            _, payload = self._post(
+                _RPC2_PATH,
+                _LOGOUT_PROBE_METHOD,
+                {},
+                session=session,
+            )
+        except _DvrHttpError as exc:
+            # An explicit auth rejection is a clear closed-session signal.
+            if exc.status_code in (401, 403):
+                return True
+            return None
+        except DvrError:
+            return None
+
+        return payload.get("result") is not True
+
+    def logout(self, *, verify: bool = False) -> bool | None:
+        """Close the DVR session with global.logout.
+
+        Idempotent: with no local session, no request is made. The local session
+        is always cleared, even if the DVR call fails. A failure raises
+        DvrLogoutError with a safe diagnostic that contains no response values.
+
+        With verify=True, after a successful logout, make exactly one
+        global.keepAlive request with the old session and return True when it
+        was rejected, False when it was still accepted, or None when the result
+        was inconclusive.
+        """
+        session = self._session_id
+        if not session:
+            return None
+
+        # TODO(spec): the capture confirms POST /RPC2 rpc=global.logout and the
+        # response keys id/result/session, but not the request body. This sends
+        # params: null as the smallest assumption and adds no other fields.
+        try:
+            try:
+                status, payload = self._post(
+                    _RPC2_PATH,
+                    _LOGOUT_METHOD,
+                    None,
+                    session=session,
+                )
+            except _DvrHttpError as exc:
+                raise DvrLogoutError(
+                    _LOGOUT_METHOD, exc.status_code, exc.payload or {}
+                ) from None
+            except DvrError:
+                raise DvrLogoutError(_LOGOUT_METHOD, None, {}) from None
+
+            if payload.get("result") is not True:
+                raise DvrLogoutError(_LOGOUT_METHOD, status, payload)
+        finally:
+            self._session_id = None
+
+        if not verify:
+            return None
+        return self._probe_closed_session(session)
 
     def close(self) -> None:
         self._http.close()
@@ -500,7 +597,7 @@ class DvrClient:
         self,
         path: str,
         method: str,
-        params: dict[str, Any],
+        params: dict[str, Any] | None,
         *,
         session: str | None = None,
         request_id: int | None = None,
