@@ -1,9 +1,9 @@
-# DVR Web — Phase 3a
+# DVR Web — Phase 3b
 
 A small, read-only web app for a Dahua DVR on the local network. It logs in to
 the DVR, reads device identity, video input channels, and selected configuration,
-and shows them in the browser. Phase 3a adds an on-demand live view through
-go2rtc.
+and shows them in the browser. Phase 3b adds lease-based stream expiry, a
+Connect action that starts every included channel, and UI fixes.
 
 All DVR API behavior is based strictly on [`api_spec.md`](api_spec.md) and the
 current `har_summary.txt`. Points that the sources do not document are marked as
@@ -18,8 +18,8 @@ through go2rtc and does not call `DvrClient` or add any DVR RPC calls.
 | File | Purpose |
 | --- | --- |
 | `dvr_client.py` | `DvrClient`: one instance per DVR session; `login()`, `keepalive()`, `get_device_info()`, `get_channels()`, `get_config(name)`, `logout()`, context-manager support |
-| `stream_manager.py` | On-demand go2rtc stream registration, limits, and cleanup; builds the RTSP URL server-side |
-| `app.py` | FastAPI app: `/`, `/health`, `/api/device/info`, `/api/channels`, `/api/config` (live config), `/api/config/{name}` (DVR config), `/api/live/{channel}/open`, `/api/live/{stream_name}/close` |
+| `stream_manager.py` | On-demand go2rtc streams, leases, limits, and cleanup; builds the RTSP URL server-side |
+| `app.py` | FastAPI app: `/`, `/health`, `/api/device/info`, `/api/channels`, `/api/config` (live config), `/api/config/{name}` (DVR config), `/api/live/{channel}/open`, `/api/live/renew`, `/api/live/{stream_name}/close`, plus the lease reaper |
 | `static/` | Plain HTML/CSS/JS frontend (no build step), including the Live view |
 | `test_dvr.py` | Manual login → device/channels/config reads → logout smoke test |
 | `.env.example` | Placeholder configuration to copy to `.env` |
@@ -67,14 +67,17 @@ DVR_USER=admin
 DVR_PASS=your-password
 ```
 
-Phase 3a adds these live-view settings (all safe defaults, no credentials):
+Phase 3b adds these live-view settings (all safe defaults, no credentials):
 
 ```dotenv
 GO2RTC_URL=http://127.0.0.1:1984
 PUBLIC_GO2RTC_URL=http://127.0.0.1:1984
 STREAM_TRANSCODE_H264=true
-MAX_LIVE_STREAMS=4
-MAX_MAIN_STREAMS=1
+MAX_CHANNEL=8
+MAX_LIVE_STREAMS=6
+MAX_MAIN_STREAMS=2
+LEASE_TIMEOUT_SECONDS=30
+LEASE_CHECK_INTERVAL_SECONDS=5
 ```
 
 - `GO2RTC_URL` is what the backend calls. It should normally stay on loopback.
@@ -83,8 +86,13 @@ MAX_MAIN_STREAMS=1
 - `STREAM_TRANSCODE_H264=true` makes the go2rtc source
   `ffmpeg:<rtsp-url>#video=h264`. Leave it true for this DVR: all of its streams
   are H.265, which the browser cannot play.
+- `MAX_CHANNEL` is the highest accepted channel number. Channels `1` through
+  `MAX_CHANNEL` are valid; the frontend also caps its tile count with it.
 - `MAX_LIVE_STREAMS` is the total number of registered live streams.
 - `MAX_MAIN_STREAMS` is the number of main-quality streams allowed at once.
+- `LEASE_TIMEOUT_SECONDS` is how long a stream survives without a renewal.
+- `LEASE_CHECK_INTERVAL_SECONDS` is how often the background reaper checks for
+  expired leases.
 
 `DVR_HOST` may include a scheme and port, for example
 `http://192.168.1.100:80`. If no scheme is given, `http://` is used. The RTSP
@@ -138,24 +146,58 @@ will proxy go2rtc behind authentication.
 
 ## Live view behaviour
 
-- One tile per channel (1-4). Only channel 2 currently has a camera, so no
-  channel is hardcoded.
-- **Start** opens the sub stream (`subtype=1`, 352x288) in an iframe using
-  go2rtc's `stream.html?src=<name>&mode=mse`.
-- **Larger view** opens the main stream (`subtype=0`) in a full-width player.
-- **Stop**, **Close larger view**, and the page `pagehide` handler call the close
-  endpoint. The page uses `navigator.sendBeacon` when it is unloading.
-- Streams are registered only while watched. The backend builds the RTSP URL
-  server-side as
+- The Live section is directly below the device cards. Tiles are built from the
+  channel count returned by `GET /api/channels`, capped at `MAX_CHANNEL`; if the
+  count is unavailable, four tiles are shown.
+- Nothing starts on page load. **Connect** starts every included channel,
+  **Disconnect** stops every playing stream (including the larger view), and the
+  per-tile **Start** and **Stop** still work.
+- Each tile has an **Include** checkbox, checked by default. The choice is saved
+  in `localStorage` per channel number; storage failures fall back to the
+  in-memory checkbox state. Exclude channels with no camera so Connect does not
+  open them.
+- **Grid quality** (`Sub` by default, `Main`) is read when **Connect** is
+  pressed; changing it does not restart streams already playing. Per-tile
+  **Start** opens the sub stream, and **Larger view** always opens the main
+  stream for that channel. Main streams count against `MAX_MAIN_STREAMS`; a
+  `429` is shown on that tile and the other channels keep starting.
+- Connect starts channels one at a time: open the stream, set the iframe `src`,
+  wait about 400 ms, then continue. This avoids several ffmpeg processes
+  starting at the same instant.
+- Start, Larger view, and Stop use go2rtc's
+  `stream.html?src=<name>&mode=mse`. The browser only ever receives the opaque
+  `cctv-` name and `PUBLIC_GO2RTC_URL`.
+- The backend builds the RTSP URL server-side as
   `rtsp://USER:PASS@HOST:554/cam/realmonitor?channel=N&subtype=S`
   (`S=1` sub, `S=0` main), URL-encodes the username and password, and sends the
   result only to go2rtc.
-- The browser receives only an opaque stream name such as `cctv-<random>`; it
-  never receives the RTSP URL or a go2rtc API response.
+- While any stream is playing, the page sends `POST /api/live/renew` every
+  10 seconds with all playing stream names (including the larger view). The
+  timer stops when nothing is playing and on `pagehide`, which also sends the
+  close beacons.
+- If renewal reports a stream as expired, its tile is marked stopped with
+  "Stream expired, press Start". The other tiles are left alone.
 - `MAX_LIVE_STREAMS` and `MAX_MAIN_STREAMS` are enforced under a lock. A limit
-  returns HTTP `429` with a clear message, shown in the Live section.
+  returns HTTP `429` with a clear message.
 - A transcoded main stream uses about one CPU core; the server has two. go2rtc
   stops pulling and transcoding when nobody is watching.
+
+### Lease expiry
+
+Each registered stream has a last-renewed time from a monotonic clock, which can
+be injected in tests. `open` starts the lease. A background asyncio task runs
+every `LEASE_CHECK_INTERVAL_SECONDS` and deletes every stream whose lease is
+older than `LEASE_TIMEOUT_SECONDS`. The slot is freed before the go2rtc delete;
+a failed delete is logged without a source URL and retried during shutdown
+cleanup. `close` removes the lease, so a closed stream can never expire later.
+
+A name that is unknown or already past its timeout is listed under `expired` by
+the renew endpoint; that is not an HTTP error. The browser turns that into the
+"Stream expired, press Start" state.
+
+Leases cover a dead tab, a closed browser, or a dropped SSH tunnel without
+relying on the `pagehide` beacon. The app process must still be running for the
+reaper to delete an expired stream.
 
 ### go2rtc persistence and cleanup
 
@@ -164,11 +206,11 @@ including the RTSP source and therefore the DVR credentials. The backend
 therefore:
 
 1. Uses only opaque names with the fixed prefix `cctv-`.
-2. Deletes each stream immediately on close.
+2. Deletes each stream immediately on close and as soon as its lease expires.
 3. On startup, lists go2rtc streams and deletes every leftover whose name starts
    with `cctv-`. Only response keys are inspected; values are never logged.
-4. On shutdown, deletes every stream it created. A close that failed earlier is
-   retried from the in-memory created set.
+4. On shutdown, deletes every stream it created. A close or expiry delete that
+   failed earlier is retried from the in-memory created set.
 
 If the process is killed without a graceful shutdown, leftovers remain in
 go2rtc's config until the next startup cleanup. Protect the go2rtc config file
@@ -229,55 +271,75 @@ is made.
    ```
 
 4. In the Windows browser open <http://127.0.0.1:8000>. The Live section should
-   show four tiles. `GET /api/config` should return only
-   `{"public_go2rtc_url": "http://127.0.0.1:1984"}`.
+   be directly below the device cards. `GET /api/config` should return only
+   `{"public_go2rtc_url": "http://127.0.0.1:1984", "max_channel": 8}`. The tile
+   count should match the DVR channel count, capped at `MAX_CHANNEL`. The
+   device-fields fallback and the Encode table should be collapsed.
 
-5. Click **Start** on channel 2 (the only channel with a camera). The iframe
-   should show the sub stream through go2rtc `mode=mse`. Click **Larger view** on
-   channel 2; the main stream should appear in the full-width player. Click
-   **Close larger view**, then **Stop**.
+5. Exclude channels with no camera with their **Include** checkbox, keep channel
+   2 included, leave **Grid quality** on **Sub**, and press **Connect**. Expect
+   channel 2 to show the sub stream and the status to report one connected
+   channel. Then press **Disconnect**; no `cctv-` name should remain.
 
-6. Verify cleanup with a names-only command. This prints only keys, never
-   stream sources:
+6. Measure the Connect burst. With the desired channels included, press
+   **Connect** and count the ffmpeg processes (names only, no arguments):
+
+   ```bash
+   pgrep -c ffmpeg
+   ```
+
+   The count should match the number of streams go2rtc is transcoding (plus any
+   unrelated ffmpeg). Measure CPU with `top`:
+
+   ```bash
+   top -b -n 1 | head -20
+   ```
+
+   Do not press `c` in interactive `top`: it shows full command lines, which can
+   include the RTSP URL with credentials. Look only at the `%CPU` column for
+   `ffmpeg`. One transcoded main stream is expected to use about one core.
+
+7. Check lease renewal while a stream plays. In another terminal, list names
+   only:
 
    ```bash
    curl -s http://127.0.0.1:1984/api/streams \
      | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)))'
    ```
 
-   After Stop and Close, no name starting with `cctv-` should remain.
-
-7. Test the 429 message through the API. Open one main stream:
-
-   ```bash
-   curl -s -X POST 'http://127.0.0.1:8000/api/live/2/open?quality=main'
-   ```
-
-   The response contains only `{"stream_name":"cctv-..."}`. Open a second main
-   stream:
+   A `cctv-` name should exist. Wait at least 30 seconds with the tab open; the
+   browser renews every 10 seconds, so the name should stay. Optionally call the
+   batch endpoint yourself (it returns only names):
 
    ```bash
-   curl -s -X POST 'http://127.0.0.1:8000/api/live/2/open?quality=main'
+   curl -s -X POST http://127.0.0.1:8000/api/live/renew \
+     -H 'Content-Type: application/json' \
+     -d '{"streams": ["cctv-..."]}'
    ```
 
-   This should return HTTP `429` with the main-stream limit message. To test the
-   total limit, start all four sub tiles in the UI and then click **Larger
-   view**; the Live section should show a clear `429` message. Close the first
-   main stream with the name from step 7:
+8. Test expiry. For a true lease test, kill the SSH tunnel while a stream is
+   playing so the tab's close beacon cannot reach the backend (closing the tab
+   may close immediately through `sendBeacon`). Leave uvicorn and go2rtc
+   running. Wait about
+   `LEASE_TIMEOUT_SECONDS + LEASE_CHECK_INTERVAL_SECONDS` (35 seconds with the
+   defaults), then run the names-only command again. No name starting with
+   `cctv-` should remain, and uvicorn should log the expired stream name.
 
-   ```bash
-   curl -s -X POST 'http://127.0.0.1:8000/api/live/<stream_name>/close'
-   ```
+9. Test the 429 message and Connect isolation. Set **Grid quality** to **Main**
+   and press **Connect** with more included channels than `MAX_MAIN_STREAMS`.
+   The first two mains should play (default limit 2); later tiles should show the
+   clear 429 message and the earlier tiles must keep playing. **Disconnect**
+   clears them.
 
-8. Test startup cleanup. Start a stream and confirm a `cctv-` name exists with
-   the names-only command. Stop uvicorn with `Ctrl+C`; graceful shutdown should
-   delete it. To simulate a crash, start a stream again and run
-   `kill -9 <uvicorn-pid>` instead, then start uvicorn again. Startup cleanup
-   should delete the leftover `cctv-` name. Verify with the names-only command.
+10. Test startup/shutdown cleanup. Start a stream and confirm a `cctv-` name
+    exists. Stop uvicorn with `Ctrl+C`; graceful shutdown should delete it. To
+    simulate a crash, start a stream again and run `kill -9 <uvicorn-pid>`, then
+    start uvicorn again; startup cleanup should delete the leftover. Verify with
+    the names-only command.
 
-9. Test page unload. Start a channel, then reload or close the tab. The
-   `pagehide` handler sends a `sendBeacon` close for every active stream; verify
-   that no `cctv-` name remains.
+11. Test page unload. Start a channel, then reload or close the tab. The
+    `pagehide` handler sends a `sendBeacon` close for every active stream; verify
+    that no `cctv-` name remains.
 
 You can also check the web API directly:
 
@@ -301,10 +363,14 @@ This is a liveness check only; it does not contact the DVR.
 
 ### `GET /api/config`
 
-Returns only the browser-facing go2rtc URL used by the Live view:
+Returns only the browser-facing go2rtc URL and the channel cap used by the Live
+view:
 
 ```json
-{"public_go2rtc_url": "http://127.0.0.1:1984"}
+{
+  "public_go2rtc_url": "http://127.0.0.1:1984",
+  "max_channel": 8
+}
 ```
 
 This is distinct from `GET /api/config/{name}`, which reads DVR configuration.
@@ -312,8 +378,9 @@ It returns no stream sources, credentials, or go2rtc API response.
 
 ### `POST /api/live/{channel}/open?quality=sub|main`
 
-Registers one on-demand go2rtc stream. `channel` must be `1`-`4`; `quality`
-defaults to `sub`. The response contains only the opaque stream name:
+Registers one on-demand go2rtc stream and starts its lease. `channel` must be
+between `1` and `MAX_CHANNEL`; `quality` defaults to `sub`. The response contains
+only the opaque stream name:
 
 ```json
 {"stream_name": "cctv-<random>"}
@@ -325,18 +392,41 @@ or logged. `quality=main` maps to RTSP `subtype=0`; `quality=sub` maps to
 
 Status codes:
 
-- `400` — channel outside 1-4, or quality not `sub`/`main`.
+- `400` — channel outside `1..MAX_CHANNEL`, or quality not `sub`/`main`.
 - `429` — `MAX_LIVE_STREAMS` or `MAX_MAIN_STREAMS` reached; the message says
   which limit was hit.
 - `502` — go2rtc could not be reached or rejected the registration.
 - `503` — live view is not configured.
 
+### `POST /api/live/renew`
+
+Extends the leases of known streams in one batch. The body must contain 1 to 16
+names, each matching the `cctv-` format:
+
+```json
+{"streams": ["cctv-<random>", "cctv-<random>"]}
+```
+
+The response separates extended names from names that are unknown or already
+past their lease. An expired name is not a `404`:
+
+```json
+{
+  "renewed": ["cctv-<random>"],
+  "expired": ["cctv-<random>"]
+}
+```
+
+Malformed input returns `400`: a non-object body, a `streams` value that is not
+a list, a list length outside 1-16, a non-string entry, or an invalid name.
+Duplicate names are answered once.
+
 ### `POST /api/live/{stream_name}/close`
 
-Deletes one stream. The response is `{"closed": true}`. It is safe to call
-twice: an unknown or already-closed name is treated as closed and is not
-forwarded to go2rtc. A malformed name returns `400`; a go2rtc deletion failure
-returns `502`.
+Deletes one stream and removes its lease. The response is `{"closed": true}`. It
+is safe to call twice: an unknown or already-closed name is treated as closed and
+is not forwarded to go2rtc. A malformed name returns `400`; a go2rtc deletion
+failure returns `502`.
 
 ### `GET /api/device/info`
 
@@ -449,6 +539,11 @@ raw DVR payload.
 - go2rtc persists API-added streams, including their RTSP source with
   credentials, in its own config. The cleanup rules above remove this app's
   streams; protect the go2rtc config file and never commit or paste it.
+- Lease expiry logs stream names and expiry events only. It never logs a source
+  URL, a password, or a go2rtc response body.
+- The per-channel **Include** preference is stored in the browser's
+  `localStorage` as a simple `1`/`0` flag; it contains no credentials or stream
+  names.
 - go2rtc is exposed to the browser only through the SSH tunnel in this phase. It
   is not proxied or authenticated by this app yet; do not expose it publicly.
 
@@ -579,9 +674,29 @@ used by this phase.
     CPU-aware.
 19. **No live DVR/go2rtc contact in this phase.** All verification used mock
     HTTP transports. The real RTSP/go2rtc path is unconfirmed until the Ubuntu
-    test below is run.
+    test steps above are run.
+20. **Background-tab timer throttling.** Browsers throttle `setInterval` in
+    hidden tabs (Chrome can limit it to about once per minute). With the default
+    30-second lease, a hidden tab may lose its streams to expiry even though it
+    is still open. Raise `LEASE_TIMEOUT_SECONDS` or keep the tab visible; this
+    was not observed in a real browser here.
+21. **Lease clock behaviour.** The manager takes an injectable monotonic clock,
+    and the mock tests use a fake one. Real suspend/hibernate behaviour of
+    `time.monotonic` across platforms was not tested.
+22. **Failed expiry deletes.** A failed go2rtc delete frees the slot immediately
+    and leaves the name in the created set for shutdown retry. Whether go2rtc
+    leaves a partially removed stream behind in that case is not verified.
+23. **Connect with channels that have no camera.** go2rtc/ffmpeg retry and CPU
+    behaviour for included channels without a camera were not measured. Exclude
+    them with the Include checkbox during the server test.
+24. **Renew and expiry UI.** The 10-second renewal timer, `pagehide` ordering,
+    and per-tile "Stream expired, press Start" state were syntax-checked but not
+    run against a live go2rtc.
+25. **`pgrep` and `top` values.** Exact ffmpeg counts and CPU percentages depend
+    on the server, go2rtc version, and stream quality; the steps describe the
+    expected shape, not measured numbers.
 
-## Out of scope for Phase 3a
+## Out of scope for Phase 3b
 
 Multiple devices, playback, configuration writes,
 reboot/factory-reset/format operations, user management, scheduled keepalive,

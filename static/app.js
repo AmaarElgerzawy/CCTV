@@ -29,6 +29,9 @@ const encodeRaw = document.getElementById("encode-raw");
 
 const liveStatus = document.getElementById("live-status");
 const liveGrid = document.getElementById("live-grid");
+const liveConnect = document.getElementById("live-connect");
+const liveDisconnect = document.getElementById("live-disconnect");
+const liveQuality = document.getElementById("live-quality");
 const liveLarge = document.getElementById("live-large");
 const liveLargeTitle = document.getElementById("live-large-title");
 const liveLargeFrame = document.getElementById("live-large-frame");
@@ -36,12 +39,20 @@ const liveLargeClose = document.getElementById("live-large-close");
 
 const CALL_METADATA_KEYS = new Set(["succeeded_calls", "failed_calls"]);
 const MAX_TABLE_ROWS = 400;
-const LIVE_CHANNELS = [1, 2, 3, 4];
+const LIVE_FALLBACK_CHANNELS = 4;
+const LIVE_RENEW_INTERVAL_MS = 10000;
+const LIVE_START_GAP_MS = 400;
+const LIVE_INCLUDE_KEY_PREFIX = "dvr-live-include-";
+const DEFAULT_MAX_CHANNEL = 8;
 
 const liveState = {
   publicUrl: null,
+  maxChannel: DEFAULT_MAX_CHANNEL,
   tiles: new Map(),
   large: null,
+  renewTimer: null,
+  connecting: false,
+  disconnecting: false,
 };
 
 function formatValue(value) {
@@ -52,6 +63,31 @@ function formatValue(value) {
     return JSON.stringify(value);
   }
   return String(value);
+}
+
+function cardText(value) {
+  if (value === null || value === undefined) {
+    return "Not reported";
+  }
+  if (typeof value === "object") {
+    if (!Array.isArray(value)) {
+      const version = value.Version;
+      if (typeof version === "string" && version.trim() !== "") {
+        return version;
+      }
+      for (const candidate of Object.values(value)) {
+        if (typeof candidate === "string" && candidate.trim() !== "") {
+          return candidate;
+        }
+        if (typeof candidate === "number") {
+          return String(candidate);
+        }
+      }
+    }
+    return JSON.stringify(value);
+  }
+  const text = String(value);
+  return text.trim() === "" ? "Not reported" : text;
 }
 
 function emptyNode(message) {
@@ -125,11 +161,7 @@ function renderFailedCalls(failedCalls) {
 
 function render(info) {
   for (const [key, element] of Object.entries(summaryFields)) {
-    const value = info[key];
-    element.textContent =
-      value === null || value === undefined || String(value).trim() === ""
-        ? "Not reported"
-        : String(value);
+    element.textContent = cardText(info[key]);
   }
   renderFailedCalls(info.failed_calls);
   renderDetails(info);
@@ -291,6 +323,7 @@ function renderChannels(channels) {
     "No channel count breakdown was reported.",
   );
   channelsRaw.textContent = JSON.stringify(channels, null, 2);
+  syncLiveTiles(typeof count === "number" ? count : null);
 
   if (failedCalls.length > 0) {
     setSectionNote(
@@ -428,6 +461,7 @@ async function loadChannels() {
     channelNames.replaceChildren();
     channelCounts.replaceChildren();
     channelsRaw.textContent = "—";
+    syncLiveTiles(null);
   }
 }
 
@@ -452,10 +486,54 @@ async function loadConfig(name, statusElement, tableElement, rawElement) {
   }
 }
 
-function createLiveTiles() {
-  const fragment = document.createDocumentFragment();
+function desiredChannelCount(count) {
+  const cap =
+    Number.isInteger(liveState.maxChannel) && liveState.maxChannel > 0
+      ? liveState.maxChannel
+      : DEFAULT_MAX_CHANNEL;
+  if (!Number.isInteger(count) || count < 1) {
+    return Math.min(LIVE_FALLBACK_CHANNELS, cap);
+  }
+  return Math.min(count, cap);
+}
 
-  for (const channel of LIVE_CHANNELS) {
+function syncLiveTiles(count) {
+  const hasActive = [...liveState.tiles.values()].some((tile) => tile.name);
+  if (hasActive) {
+    return;
+  }
+  const desired = desiredChannelCount(count);
+  if (liveState.tiles.size === desired) {
+    return;
+  }
+  createLiveTiles(desired);
+}
+
+function readInclude(channel) {
+  try {
+    const stored = localStorage.getItem(`${LIVE_INCLUDE_KEY_PREFIX}${channel}`);
+    return stored === null ? true : stored === "1";
+  } catch {
+    return true;
+  }
+}
+
+function writeInclude(channel, included) {
+  try {
+    localStorage.setItem(
+      `${LIVE_INCLUDE_KEY_PREFIX}${channel}`,
+      included ? "1" : "0",
+    );
+  } catch {
+    // Private browsing or a full quota must not break the page.
+  }
+}
+
+function createLiveTiles(count) {
+  const fragment = document.createDocumentFragment();
+  liveState.tiles.clear();
+
+  for (let channel = 1; channel <= count; channel += 1) {
     const tile = document.createElement("article");
     tile.className = "live-tile";
     tile.dataset.channel = String(channel);
@@ -466,10 +544,22 @@ function createLiveTiles() {
     const title = document.createElement("h3");
     title.textContent = `Channel ${channel}`;
 
+    const includeLabel = document.createElement("label");
+    includeLabel.className = "live-include";
+    includeLabel.title = "Include this channel in Connect";
+
+    const include = document.createElement("input");
+    include.type = "checkbox";
+    include.checked = readInclude(channel);
+    include.addEventListener("change", () =>
+      writeInclude(channel, include.checked),
+    );
+    includeLabel.append(include, document.createTextNode("Include"));
+
     const badge = document.createElement("span");
     badge.className = "live-badge";
     badge.textContent = "Idle";
-    head.append(title, badge);
+    head.append(title, includeLabel, badge);
 
     const frame = document.createElement("div");
     frame.className = "live-frame";
@@ -510,6 +600,7 @@ function createLiveTiles() {
     liveState.tiles.set(channel, {
       name: null,
       quality: null,
+      include,
       frame,
       badge,
       start,
@@ -520,6 +611,7 @@ function createLiveTiles() {
   }
 
   liveGrid.replaceChildren(fragment);
+  updateLiveButtons();
 }
 
 function setTileStatus(channel, state, message) {
@@ -531,14 +623,46 @@ function setTileStatus(channel, state, message) {
   tile.status.textContent = message;
 }
 
+function playingNames() {
+  const names = new Set();
+  for (const tile of liveState.tiles.values()) {
+    if (tile.name) {
+      names.add(tile.name);
+    }
+  }
+  if (liveState.large) {
+    names.add(liveState.large.name);
+  }
+  return names;
+}
+
 function updateLiveButtons() {
+  const busy = liveState.connecting || liveState.disconnecting;
+  const anyPlaying = playingNames().size > 0;
+
   for (const tile of liveState.tiles.values()) {
     const active = Boolean(tile.name);
-    tile.start.disabled = active || !liveState.publicUrl;
-    tile.stop.disabled = !active;
-    tile.large.disabled = !liveState.publicUrl;
+    tile.start.disabled = active || !liveState.publicUrl || busy;
+    tile.stop.disabled = !active || busy;
+    tile.large.disabled = !liveState.publicUrl || busy;
   }
-  liveLargeClose.disabled = !liveState.large;
+
+  liveLargeClose.disabled = !liveState.large || busy;
+  liveConnect.disabled = !liveState.publicUrl || busy;
+  liveDisconnect.disabled = !anyPlaying || busy;
+  liveQuality.disabled = busy;
+
+  if (anyPlaying) {
+    ensureRenewTimer();
+  } else {
+    stopRenewTimer();
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
 function playerUrl(name) {
@@ -572,22 +696,23 @@ async function closeStream(name) {
   });
 }
 
-async function startTile(channel) {
+async function startTile(channel, quality = "sub", gap = false) {
   const tile = liveState.tiles.get(channel);
   if (!tile || tile.name) {
-    return;
+    return false;
   }
   if (!liveState.publicUrl) {
     setTileStatus(channel, "error", "Live view is not configured.");
-    return;
+    return false;
   }
 
+  const selected = quality === "main" ? "main" : "sub";
   tile.start.disabled = true;
-  setTileStatus(channel, "loading", "Opening sub stream…");
+  setTileStatus(channel, "loading", `Opening ${selected} stream…`);
 
   try {
     const payload = await fetchJson(
-      `/api/live/${channel}/open?quality=sub`,
+      `/api/live/${channel}/open?quality=${selected}`,
       { method: "POST" },
     );
     const name = payload?.stream_name;
@@ -596,13 +721,18 @@ async function startTile(channel) {
     }
 
     tile.name = name;
-    tile.quality = "sub";
+    tile.quality = selected;
     tile.frame.replaceChildren(
-      buildLiveFrame(name, `Channel ${channel} sub stream`),
+      buildLiveFrame(name, `Channel ${channel} ${selected} stream`),
     );
     tile.badge.textContent = "Live";
     tile.badge.className = "live-badge live";
-    setTileStatus(channel, "ok", "Sub stream playing.");
+    setTileStatus(
+      channel,
+      "ok",
+      `${selected === "main" ? "Main" : "Sub"} stream playing.`,
+    );
+    return true;
   } catch (error) {
     tile.frame.replaceChildren(emptyNode("Not started."));
     tile.badge.textContent = "Idle";
@@ -612,15 +742,19 @@ async function startTile(channel) {
       "error",
       error.message || "Could not start the live stream.",
     );
+    return false;
   } finally {
     updateLiveButtons();
+    if (gap) {
+      await sleep(LIVE_START_GAP_MS);
+    }
   }
 }
 
 async function stopTile(channel) {
   const tile = liveState.tiles.get(channel);
   if (!tile || !tile.name) {
-    return;
+    return false;
   }
 
   const name = tile.name;
@@ -628,9 +762,11 @@ async function stopTile(channel) {
   tile.quality = null;
   tile.stop.disabled = true;
   setTileStatus(channel, "loading", "Stopping…");
+  let stopped = false;
 
   try {
     await closeStream(name);
+    stopped = true;
     setTileStatus(channel, "ok", "Stopped.");
   } catch (error) {
     setTileStatus(
@@ -644,6 +780,177 @@ async function stopTile(channel) {
     tile.badge.className = "live-badge";
     updateLiveButtons();
   }
+  return stopped;
+}
+
+function ensureRenewTimer() {
+  if (liveState.renewTimer !== null) {
+    return;
+  }
+  if (playingNames().size === 0) {
+    return;
+  }
+  liveState.renewTimer = window.setInterval(
+    renewLeases,
+    LIVE_RENEW_INTERVAL_MS,
+  );
+}
+
+function stopRenewTimer() {
+  if (liveState.renewTimer === null) {
+    return;
+  }
+  window.clearInterval(liveState.renewTimer);
+  liveState.renewTimer = null;
+}
+
+function markExpired(name) {
+  let handled = false;
+
+  for (const [channel, tile] of liveState.tiles) {
+    if (tile.name !== name) {
+      continue;
+    }
+    tile.name = null;
+    tile.quality = null;
+    tile.frame.replaceChildren(emptyNode("Not started."));
+    tile.badge.textContent = "Expired";
+    tile.badge.className = "live-badge expired";
+    setTileStatus(channel, "warn", "Stream expired, press Start.");
+    handled = true;
+  }
+
+  if (liveState.large && liveState.large.name === name) {
+    clearLargeView();
+    handled = true;
+  }
+
+  return handled;
+}
+
+async function renewLeases() {
+  const names = [...playingNames()];
+  if (names.length === 0) {
+    stopRenewTimer();
+    return;
+  }
+
+  try {
+    const payload = await fetchJson("/api/live/renew", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ streams: names }),
+    });
+    const expired = Array.isArray(payload?.expired) ? payload.expired : [];
+    let expiredCount = 0;
+    for (const name of expired) {
+      if (typeof name === "string" && markExpired(name)) {
+        expiredCount += 1;
+      }
+    }
+    if (expiredCount > 0) {
+      setSectionNote(
+        liveStatus,
+        "warn",
+        `${expiredCount} stream${
+          expiredCount === 1 ? "" : "s"
+        } expired. Press Start to reconnect.`,
+      );
+    }
+  } catch (error) {
+    setSectionNote(
+      liveStatus,
+      "warn",
+      "Could not renew live streams; retrying.",
+    );
+  } finally {
+    updateLiveButtons();
+  }
+}
+
+async function connectAll() {
+  if (
+    !liveState.publicUrl ||
+    liveState.connecting ||
+    liveState.disconnecting
+  ) {
+    return;
+  }
+
+  const quality = liveQuality.value === "main" ? "main" : "sub";
+  const channels = [...liveState.tiles.entries()]
+    .filter(([, tile]) => tile.include.checked && !tile.name)
+    .map(([channel]) => channel);
+
+  if (channels.length === 0) {
+    setSectionNote(
+      liveStatus,
+      "warn",
+      "No included channels are waiting to start.",
+    );
+    return;
+  }
+
+  liveState.connecting = true;
+  updateLiveButtons();
+  setSectionNote(
+    liveStatus,
+    "loading",
+    `Connecting ${channels.length} included channel${
+      channels.length === 1 ? "" : "s"
+    } (${quality})…`,
+  );
+
+  let started = 0;
+  for (const channel of channels) {
+    if (await startTile(channel, quality, true)) {
+      started += 1;
+    }
+  }
+
+  liveState.connecting = false;
+  updateLiveButtons();
+  setSectionNote(
+    liveStatus,
+    started === channels.length ? "ok" : "warn",
+    `Connected ${started} of ${channels.length} channel${
+      channels.length === 1 ? "" : "s"
+    }.`,
+  );
+}
+
+async function disconnectAll() {
+  if (liveState.disconnecting) {
+    return;
+  }
+
+  liveState.disconnecting = true;
+  updateLiveButtons();
+
+  let stopped = 0;
+  if (liveState.large) {
+    if (await closeLarge()) {
+      stopped += 1;
+    }
+  }
+  for (const [channel, tile] of liveState.tiles) {
+    if (!tile.name) {
+      continue;
+    }
+    if (await stopTile(channel)) {
+      stopped += 1;
+    }
+  }
+
+  liveState.disconnecting = false;
+  updateLiveButtons();
+  setSectionNote(
+    liveStatus,
+    stopped > 0 ? "ok" : "warn",
+    stopped > 0
+      ? `Disconnected ${stopped} stream${stopped === 1 ? "" : "s"}.`
+      : "No streams were playing.",
+  );
 }
 
 function clearLargeView() {
@@ -713,11 +1020,13 @@ async function openLarge(channel) {
 async function closeLarge() {
   const large = liveState.large;
   if (!large) {
-    return;
+    return false;
   }
 
+  let closed = false;
   try {
     await closeStream(large.name);
+    closed = true;
     setSectionNote(liveStatus, "ok", "Larger view closed.");
   } catch (error) {
     setSectionNote(
@@ -728,9 +1037,11 @@ async function closeLarge() {
   } finally {
     clearLargeView();
   }
+  return closed;
 }
 
 function closeAllOnUnload() {
+  stopRenewTimer();
   const names = new Set();
   for (const tile of liveState.tiles.values()) {
     if (tile.name) {
@@ -755,10 +1066,15 @@ async function loadLiveConfig() {
       throw new Error("The server did not return a usable go2rtc URL.");
     }
     liveState.publicUrl = url.replace(/\/+$/, "");
+    const maxChannel = payload?.max_channel;
+    liveState.maxChannel =
+      Number.isInteger(maxChannel) && maxChannel > 0
+        ? maxChannel
+        : DEFAULT_MAX_CHANNEL;
     setSectionNote(
       liveStatus,
       "ok",
-      "Start a channel to open an on-demand stream.",
+      "Press Connect to start the included channels.",
     );
   } catch (error) {
     liveState.publicUrl = null;
@@ -769,6 +1085,7 @@ async function loadLiveConfig() {
     );
   }
 
+  syncLiveTiles(null);
   updateLiveButtons();
 }
 
@@ -785,8 +1102,9 @@ async function loadAll() {
 }
 
 refreshButton.addEventListener("click", loadAll);
+liveConnect.addEventListener("click", connectAll);
+liveDisconnect.addEventListener("click", disconnectAll);
 liveLargeClose.addEventListener("click", closeLarge);
 window.addEventListener("pagehide", closeAllOnUnload);
-createLiveTiles();
 updateLiveButtons();
 loadAll();

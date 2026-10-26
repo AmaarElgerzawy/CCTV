@@ -1,5 +1,6 @@
+import asyncio
 import logging
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterator
 
@@ -24,6 +25,7 @@ from stream_manager import (
     StreamLimitError,
     StreamManager,
     is_stream_name,
+    max_channel_from_env,
     public_go2rtc_url,
 )
 
@@ -33,10 +35,30 @@ STATIC_DIR = BASE_DIR / "static"
 logger = logging.getLogger(__name__)
 
 
+async def _lease_reaper(manager: StreamManager) -> None:
+    """Unregister expired leases on a fixed tick until cancelled."""
+    while True:
+        await asyncio.sleep(manager.lease_check_interval)
+        try:
+            expired = await asyncio.to_thread(manager.expire_leases)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # keep ticking on unexpected failures
+            logger.warning(
+                "Lease expiry check failed: %s", type(exc).__name__
+            )
+            continue
+        if expired:
+            logger.info(
+                "Live stream lease expired: %s", ", ".join(expired)
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Create the live manager, clean leftovers, and clean up on shutdown."""
     manager: StreamManager | None = None
+    reaper: asyncio.Task[None] | None = None
     try:
         manager = StreamManager.from_env()
     except StreamConfigError as exc:
@@ -53,10 +75,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.warning(
                 "Live stream startup cleanup failed: %s", type(exc).__name__
             )
+        reaper = asyncio.create_task(_lease_reaper(manager))
 
     try:
         yield
     finally:
+        if reaper is not None:
+            reaper.cancel()
+            with suppress(asyncio.CancelledError):
+                await reaper
         if manager is not None:
             try:
                 manager.cleanup_created()
@@ -69,7 +96,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 manager.close()
 
 
-app = FastAPI(title="DVR Web", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="DVR Web", version="0.4.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -164,13 +191,16 @@ def _live_manager(request: Request) -> StreamManager:
 
 @app.get("/api/config")
 def live_config() -> JSONResponse:
-    """Return only the browser-facing go2rtc URL."""
+    """Return only the browser-facing go2rtc URL and the channel cap."""
     try:
         url = public_go2rtc_url()
+        max_channel = max_channel_from_env()
     except StreamConfigError as exc:
-        logger.warning("Public go2rtc URL is not configured: %s", exc)
+        logger.warning("Live view is not configured: %s", exc)
         return _error(503, str(exc))
-    return JSONResponse({"public_go2rtc_url": url})
+    return JSONResponse(
+        {"public_go2rtc_url": url, "max_channel": max_channel}
+    )
 
 
 @app.post("/api/live/{channel}/open")
@@ -180,13 +210,17 @@ def open_live(
     quality: str = "sub",
 ) -> JSONResponse:
     """Register one on-demand stream and return only its opaque name."""
-    if not 1 <= channel <= 4:
-        return _error(400, "Channel must be between 1 and 4.")
     if quality not in {"sub", "main"}:
         return _error(400, "Quality must be sub or main.")
 
     try:
-        stream_name = _live_manager(request).open(channel, quality)
+        manager = _live_manager(request)
+        if not 1 <= channel <= manager.max_channel:
+            return _error(
+                400,
+                f"Channel must be between 1 and {manager.max_channel}.",
+            )
+        stream_name = manager.open(channel, quality)
     except StreamLimitError as exc:
         return _error(429, str(exc))
     except StreamConfigError as exc:
@@ -200,6 +234,39 @@ def open_live(
         return _error(500, "Unexpected server error.")
 
     return JSONResponse({"stream_name": stream_name})
+
+
+@app.post("/api/live/renew")
+async def renew_live(request: Request) -> JSONResponse:
+    """Extend every known, unexpired lease in one batch."""
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "Body must be a JSON object with a streams list.")
+
+    if not isinstance(body, dict):
+        return _error(400, "Body must be a JSON object with a streams list.")
+    streams = body.get("streams")
+    if not isinstance(streams, list) or not 1 <= len(streams) <= 16:
+        return _error(
+            400, "streams must be a list of 1 to 16 stream names."
+        )
+    if any(
+        not isinstance(name, str) or not is_stream_name(name)
+        for name in streams
+    ):
+        return _error(400, "Every stream name must use the cctv- format.")
+
+    try:
+        renewed, expired = _live_manager(request).renew(streams)
+    except StreamConfigError as exc:
+        logger.warning("Live view is not configured: %s", exc)
+        return _error(503, str(exc))
+    except Exception as exc:  # defensive: never expose an upstream response
+        logger.error("Unexpected lease-renewal error: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
+
+    return JSONResponse({"renewed": renewed, "expired": expired})
 
 
 @app.post("/api/live/{stream_name}/close")

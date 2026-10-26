@@ -10,12 +10,14 @@ DvrClient and makes no DVR RPC calls.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import threading
+import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -26,8 +28,11 @@ logger = logging.getLogger(__name__)
 STREAM_PREFIX = "cctv-"
 DEFAULT_GO2RTC_URL = "http://127.0.0.1:1984"
 DEFAULT_PUBLIC_GO2RTC_URL = "http://127.0.0.1:1984"
-DEFAULT_MAX_LIVE_STREAMS = 4
-DEFAULT_MAX_MAIN_STREAMS = 1
+DEFAULT_MAX_CHANNEL = 8
+DEFAULT_MAX_LIVE_STREAMS = 6
+DEFAULT_MAX_MAIN_STREAMS = 2
+DEFAULT_LEASE_TIMEOUT_SECONDS = 30.0
+DEFAULT_LEASE_CHECK_INTERVAL_SECONDS = 5.0
 _RTSP_PORT = 554
 _STREAM_NAME = re.compile(r"^cctv-[A-Za-z0-9_-]{8,64}$")
 
@@ -44,10 +49,11 @@ class StreamLimitError(StreamError):
     """A configured stream limit would be exceeded."""
 
 
-@dataclass(frozen=True)
+@dataclass
 class ActiveStream:
     channel: int
     quality: str
+    last_renewed: float
 
 
 def is_stream_name(name: str) -> bool:
@@ -68,6 +74,12 @@ def public_go2rtc_url() -> str:
     return _env_url("PUBLIC_GO2RTC_URL", DEFAULT_PUBLIC_GO2RTC_URL)
 
 
+def max_channel_from_env() -> int:
+    """Return the highest accepted channel number, for the browser config."""
+    load_dotenv()
+    return _env_positive_int("MAX_CHANNEL", DEFAULT_MAX_CHANNEL)
+
+
 def _env_positive_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -78,6 +90,19 @@ def _env_positive_int(name: str, default: int) -> int:
         raise StreamConfigError(f"{name} must be a positive integer") from None
     if value < 1:
         raise StreamConfigError(f"{name} must be a positive integer")
+    return value
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise StreamConfigError(f"{name} must be a positive number") from None
+    if value <= 0 or not math.isfinite(value):
+        raise StreamConfigError(f"{name} must be a positive number")
     return value
 
 
@@ -121,19 +146,31 @@ class StreamManager:
         dvr_user: str,
         dvr_pass: str,
         transcode_h264: bool = True,
+        max_channel: int = DEFAULT_MAX_CHANNEL,
         max_live_streams: int = DEFAULT_MAX_LIVE_STREAMS,
         max_main_streams: int = DEFAULT_MAX_MAIN_STREAMS,
+        lease_timeout: float = DEFAULT_LEASE_TIMEOUT_SECONDS,
+        lease_check_interval: float = DEFAULT_LEASE_CHECK_INTERVAL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
         timeout: float = 10.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        if max_channel < 1:
+            raise StreamConfigError("MAX_CHANNEL must be a positive integer")
         if max_live_streams < 1 or max_main_streams < 1:
             raise StreamConfigError("Stream limits must be positive integers")
+        if lease_timeout <= 0 or lease_check_interval <= 0:
+            raise StreamConfigError("Lease settings must be positive numbers")
         self._dvr_host = _dvr_hostname(dvr_host)
         self._dvr_user = dvr_user
         self._dvr_pass = dvr_pass
         self._transcode_h264 = transcode_h264
+        self._max_channel = max_channel
         self._max_live_streams = max_live_streams
         self._max_main_streams = max_main_streams
+        self._lease_timeout = lease_timeout
+        self._lease_check_interval = lease_check_interval
+        self._clock = clock
         self._active: dict[str, ActiveStream] = {}
         self._created: set[str] = set()
         self._lock = threading.Lock()
@@ -166,14 +203,30 @@ class StreamManager:
             dvr_user=os.environ["DVR_USER"],
             dvr_pass=os.environ["DVR_PASS"],
             transcode_h264=_env_bool("STREAM_TRANSCODE_H264", True),
+            max_channel=_env_positive_int("MAX_CHANNEL", DEFAULT_MAX_CHANNEL),
             max_live_streams=_env_positive_int(
                 "MAX_LIVE_STREAMS", DEFAULT_MAX_LIVE_STREAMS
             ),
             max_main_streams=_env_positive_int(
                 "MAX_MAIN_STREAMS", DEFAULT_MAX_MAIN_STREAMS
             ),
+            lease_timeout=_env_positive_float(
+                "LEASE_TIMEOUT_SECONDS", DEFAULT_LEASE_TIMEOUT_SECONDS
+            ),
+            lease_check_interval=_env_positive_float(
+                "LEASE_CHECK_INTERVAL_SECONDS",
+                DEFAULT_LEASE_CHECK_INTERVAL_SECONDS,
+            ),
             **kwargs,
         )
+
+    @property
+    def max_channel(self) -> int:
+        return self._max_channel
+
+    @property
+    def lease_check_interval(self) -> float:
+        return self._lease_check_interval
 
     @property
     def active_count(self) -> int:
@@ -195,8 +248,10 @@ class StreamManager:
         """
         if quality not in {"sub", "main"}:
             raise StreamConfigError("quality must be sub or main")
-        if not 1 <= channel <= 4:
-            raise StreamConfigError("channel must be between 1 and 4")
+        if not 1 <= channel <= self._max_channel:
+            raise StreamConfigError(
+                f"channel must be between 1 and {self._max_channel}"
+            )
 
         name = f"{STREAM_PREFIX}{uuid.uuid4().hex}"
         with self._lock:
@@ -215,7 +270,11 @@ class StreamManager:
                     f"Main-stream limit reached ({self._max_main_streams}). "
                     "Close the larger view and try again."
                 )
-            self._active[name] = ActiveStream(channel=channel, quality=quality)
+            self._active[name] = ActiveStream(
+                channel=channel,
+                quality=quality,
+                last_renewed=self._clock(),
+            )
             self._created.add(name)
 
         try:
@@ -232,6 +291,7 @@ class StreamManager:
 
         Idempotent: a name this process does not know is treated as closed and
         is not forwarded to go2rtc, so arbitrary names cannot be deleted.
+        Closing also removes the lease, so it can never be expired later.
         """
         if not is_stream_name(name):
             raise StreamConfigError("Invalid stream name")
@@ -243,6 +303,57 @@ class StreamManager:
         self._delete(name)
         with self._lock:
             self._created.discard(name)
+
+    def renew(self, names: list[str]) -> tuple[list[str], list[str]]:
+        """Extend leases for known, unexpired streams.
+
+        Unknown and already-expired names are returned separately; they are not
+        an error. Duplicate input names are answered once.
+        """
+        now = self._clock()
+        renewed: list[str] = []
+        expired: list[str] = []
+        seen: set[str] = set()
+        with self._lock:
+            for name in names:
+                if name in seen:
+                    continue
+                seen.add(name)
+                stream = self._active.get(name)
+                if (
+                    stream is None
+                    or now - stream.last_renewed >= self._lease_timeout
+                ):
+                    expired.append(name)
+                    continue
+                stream.last_renewed = now
+                renewed.append(name)
+        return renewed, expired
+
+    def expire_leases(self) -> list[str]:
+        """Unregister every stream whose lease has expired.
+
+        The slot is freed under the lock before the go2rtc delete. A failed
+        delete keeps the name in the created set so shutdown can retry it.
+        """
+        now = self._clock()
+        with self._lock:
+            expired = [
+                name
+                for name, stream in self._active.items()
+                if now - stream.last_renewed >= self._lease_timeout
+            ]
+            for name in expired:
+                self._active.pop(name, None)
+        for name in expired:
+            try:
+                self._delete(name)
+            except StreamError:
+                logger.warning("go2rtc could not delete an expired stream")
+                continue
+            with self._lock:
+                self._created.discard(name)
+        return expired
 
     def cleanup_leftovers(self) -> int:
         """Delete cctv-* streams left by an earlier process.

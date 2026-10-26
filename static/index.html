@@ -49,34 +49,31 @@
       is listed below as a fallback.
     </p>
 
-    <section class="panel" aria-labelledby="details-title">
-      <div class="panel-head">
-        <h2 id="details-title">Reported device fields</h2>
-        <span id="field-count" class="muted"></span>
-      </div>
-      <dl id="details" class="details">
-        <div class="empty">No fields to display.</div>
-      </dl>
-    </section>
-
-    <section class="panel" aria-labelledby="channels-title">
-      <div class="panel-head">
-        <h2 id="channels-title">Channels</h2>
-        <span id="channel-count" class="badge">—</span>
-      </div>
-      <p id="channels-status" class="section-note">Loading channels…</p>
-      <div id="channel-names" class="name-list"></div>
-      <div id="channel-counts" class="table-wrap"></div>
-      <details class="subraw">
-        <summary>Raw channels response</summary>
-        <pre id="channels-raw">—</pre>
-      </details>
-    </section>
-
     <section class="panel" aria-labelledby="live-title">
       <div class="panel-head">
         <h2 id="live-title">Live view</h2>
         <span class="muted">On demand</span>
+      </div>
+      <div class="live-toolbar">
+        <div class="live-toolbar-actions">
+          <button id="live-connect" class="button" type="button">
+            Connect
+          </button>
+          <button
+            id="live-disconnect"
+            class="button button-ghost"
+            type="button"
+          >
+            Disconnect
+          </button>
+        </div>
+        <label class="live-quality" for="live-quality">
+          Grid quality
+          <select id="live-quality">
+            <option value="sub" selected>Sub</option>
+            <option value="main">Main</option>
+          </select>
+        </label>
       </div>
       <p id="live-status" class="section-note">
         Loading live-view configuration…
@@ -97,6 +94,30 @@
       <div id="live-grid" class="live-grid"></div>
     </section>
 
+    <details class="panel panel-collapse">
+      <summary>
+        Reported device fields
+        <span id="field-count" class="muted"></span>
+      </summary>
+      <dl id="details" class="details">
+        <div class="empty">No fields to display.</div>
+      </dl>
+    </details>
+
+    <section class="panel" aria-labelledby="channels-title">
+      <div class="panel-head">
+        <h2 id="channels-title">Channels</h2>
+        <span id="channel-count" class="badge">—</span>
+      </div>
+      <p id="channels-status" class="section-note">Loading channels…</p>
+      <div id="channel-names" class="name-list"></div>
+      <div id="channel-counts" class="table-wrap"></div>
+      <details class="subraw">
+        <summary>Raw channels response</summary>
+        <pre id="channels-raw">—</pre>
+      </details>
+    </section>
+
     <section class="panel" aria-labelledby="settings-title">
       <div class="panel-head">
         <h2 id="settings-title">Settings</h2>
@@ -115,7 +136,10 @@
         <article class="config-block">
           <h3>Encode</h3>
           <p id="encode-status" class="section-note">Loading…</p>
-          <div id="encode-table" class="table-wrap"></div>
+          <details class="subraw">
+            <summary>Encode fields</summary>
+            <div id="encode-table" class="table-wrap"></div>
+          </details>
           <details class="subraw">
             <summary>Raw Encode response</summary>
             <pre id="encode-raw">—</pre>

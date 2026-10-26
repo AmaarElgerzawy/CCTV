@@ -237,6 +237,27 @@ h2 {
   font-size: 12px;
 }
 
+.panel-collapse > summary {
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.panel-collapse > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.panel-collapse > summary .muted {
+  margin-left: 8px;
+}
+
+.panel-collapse[open] > summary {
+  margin-bottom: 10px;
+}
+
 .details {
   margin: 0;
 }
@@ -433,6 +454,53 @@ h2 {
   cursor: not-allowed;
 }
 
+.live-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 4px 0 12px;
+}
+
+.live-toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.live-quality {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.live-quality select {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+  font-size: 13px;
+}
+
+.live-include {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.live-include input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
 .live-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -457,6 +525,7 @@ h2 {
 
 .live-tile-head h3 {
   margin: 0;
+  margin-right: auto;
   font-size: 14px;
   letter-spacing: -0.01em;
 }
@@ -476,6 +545,11 @@ h2 {
 .live-badge.live {
   color: #fff;
   background: var(--accent);
+}
+
+.live-badge.expired {
+  color: #92400e;
+  background: #fffbeb;
 }
 
 .live-frame {
