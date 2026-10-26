@@ -1,9 +1,9 @@
 import logging
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, AsyncIterator, Callable, Iterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -18,14 +18,59 @@ from dvr_client import (
     DvrSessionExpired,
     mask_sensitive,
 )
+from stream_manager import (
+    StreamConfigError,
+    StreamError,
+    StreamLimitError,
+    StreamManager,
+    is_stream_name,
+    public_go2rtc_url,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="DVR Web", version="0.2.0")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Create the live manager, clean leftovers, and clean up on shutdown."""
+    manager: StreamManager | None = None
+    try:
+        manager = StreamManager.from_env()
+    except StreamConfigError as exc:
+        logger.warning("Live view is not configured: %s", exc)
+    except Exception as exc:  # defensive: keep the read-only app available
+        logger.error("Live view could not start: %s", type(exc).__name__)
+
+    app.state.stream_manager = manager
+
+    if manager is not None:
+        try:
+            manager.cleanup_leftovers()
+        except Exception as exc:  # defensive
+            logger.warning(
+                "Live stream startup cleanup failed: %s", type(exc).__name__
+            )
+
+    try:
+        yield
+    finally:
+        if manager is not None:
+            try:
+                manager.cleanup_created()
+            except Exception as exc:  # defensive
+                logger.warning(
+                    "Live stream shutdown cleanup failed: %s",
+                    type(exc).__name__,
+                )
+            finally:
+                manager.close()
+
+
+app = FastAPI(title="DVR Web", version="0.3.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @contextmanager
@@ -105,6 +150,77 @@ def channels() -> JSONResponse:
     return _read_device(
         lambda client: {"channels": mask_sensitive(client.get_channels())}
     )
+
+
+def _live_manager(request: Request) -> StreamManager:
+    manager = getattr(request.app.state, "stream_manager", None)
+    if manager is None:
+        raise StreamConfigError(
+            "Live view is not configured. Set DVR_HOST, DVR_USER, DVR_PASS "
+            "and the go2rtc settings in .env."
+        )
+    return manager
+
+
+@app.get("/api/config")
+def live_config() -> JSONResponse:
+    """Return only the browser-facing go2rtc URL."""
+    try:
+        url = public_go2rtc_url()
+    except StreamConfigError as exc:
+        logger.warning("Public go2rtc URL is not configured: %s", exc)
+        return _error(503, str(exc))
+    return JSONResponse({"public_go2rtc_url": url})
+
+
+@app.post("/api/live/{channel}/open")
+def open_live(
+    channel: int,
+    request: Request,
+    quality: str = "sub",
+) -> JSONResponse:
+    """Register one on-demand stream and return only its opaque name."""
+    if not 1 <= channel <= 4:
+        return _error(400, "Channel must be between 1 and 4.")
+    if quality not in {"sub", "main"}:
+        return _error(400, "Quality must be sub or main.")
+
+    try:
+        stream_name = _live_manager(request).open(channel, quality)
+    except StreamLimitError as exc:
+        return _error(429, str(exc))
+    except StreamConfigError as exc:
+        logger.warning("Live view is not configured: %s", exc)
+        return _error(503, str(exc))
+    except StreamError as exc:
+        logger.warning("Live stream registration failed: %s", exc)
+        return _error(502, "Could not start the live stream.")
+    except Exception as exc:  # defensive: never expose an upstream response
+        logger.error("Unexpected live-stream error: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
+
+    return JSONResponse({"stream_name": stream_name})
+
+
+@app.post("/api/live/{stream_name}/close")
+def close_live(stream_name: str, request: Request) -> JSONResponse:
+    """Delete one stream. Safe to call twice."""
+    if not is_stream_name(stream_name):
+        return _error(400, "Invalid stream name.")
+
+    try:
+        _live_manager(request).close_stream(stream_name)
+    except StreamConfigError as exc:
+        logger.warning("Live view is not configured: %s", exc)
+        return _error(503, str(exc))
+    except StreamError as exc:
+        logger.warning("Live stream removal failed: %s", exc)
+        return _error(502, "Could not stop the live stream.")
+    except Exception as exc:  # defensive: never expose an upstream response
+        logger.error("Unexpected live-stream error: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
+
+    return JSONResponse({"closed": True})
 
 
 @app.get("/api/config/{name}")

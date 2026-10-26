@@ -1,21 +1,26 @@
-# DVR Web — Phase 2
+# DVR Web — Phase 3a
 
 A small, read-only web app for a Dahua DVR on the local network. It logs in to
 the DVR, reads device identity, video input channels, and selected configuration,
-and shows them in the browser.
+and shows them in the browser. Phase 3a adds an on-demand live view through
+go2rtc.
 
 All DVR API behavior is based strictly on [`api_spec.md`](api_spec.md) and the
 current `har_summary.txt`. Points that the sources do not document are marked as
 TODO in the code and listed at the end of this file. The app does not guess
 write methods and never sends a set/write/reboot/format call.
 
+Live video is separate from the DVR JSON-RPC session: the live path uses RTSP
+through go2rtc and does not call `DvrClient` or add any DVR RPC calls.
+
 ## Project layout
 
 | File | Purpose |
 | --- | --- |
 | `dvr_client.py` | `DvrClient`: one instance per DVR session; `login()`, `keepalive()`, `get_device_info()`, `get_channels()`, `get_config(name)`, `logout()`, context-manager support |
-| `app.py` | FastAPI app: `/`, `/health`, `/api/device/info`, `/api/channels`, `/api/config/{name}` |
-| `static/` | Plain HTML/CSS/JS frontend (no build step) |
+| `stream_manager.py` | On-demand go2rtc stream registration, limits, and cleanup; builds the RTSP URL server-side |
+| `app.py` | FastAPI app: `/`, `/health`, `/api/device/info`, `/api/channels`, `/api/config` (live config), `/api/config/{name}` (DVR config), `/api/live/{channel}/open`, `/api/live/{stream_name}/close` |
+| `static/` | Plain HTML/CSS/JS frontend (no build step), including the Live view |
 | `test_dvr.py` | Manual login → device/channels/config reads → logout smoke test |
 | `.env.example` | Placeholder configuration to copy to `.env` |
 | `api_spec.md` | DVR API notes this implementation is based on |
@@ -23,8 +28,12 @@ write methods and never sends a set/write/reboot/format call.
 ## Requirements
 
 - Python 3.11 or newer
-- Network access to the DVR's web interface
+- Network access to the DVR's web interface and RTSP service
 - DVR web credentials with read access
+- A running go2rtc instance with access to `ffmpeg` for H.264 transcoding
+- On the Ubuntu server, a go2rtc API reachable at `GO2RTC_URL`
+  (default `http://127.0.0.1:1984`)
+
 
 ## Setup
 
@@ -58,12 +67,35 @@ DVR_USER=admin
 DVR_PASS=your-password
 ```
 
+Phase 3a adds these live-view settings (all safe defaults, no credentials):
+
+```dotenv
+GO2RTC_URL=http://127.0.0.1:1984
+PUBLIC_GO2RTC_URL=http://127.0.0.1:1984
+STREAM_TRANSCODE_H264=true
+MAX_LIVE_STREAMS=4
+MAX_MAIN_STREAMS=1
+```
+
+- `GO2RTC_URL` is what the backend calls. It should normally stay on loopback.
+- `PUBLIC_GO2RTC_URL` is what the browser uses for the player iframe. Through the
+  SSH tunnel it is also `http://127.0.0.1:1984`.
+- `STREAM_TRANSCODE_H264=true` makes the go2rtc source
+  `ffmpeg:<rtsp-url>#video=h264`. Leave it true for this DVR: all of its streams
+  are H.265, which the browser cannot play.
+- `MAX_LIVE_STREAMS` is the total number of registered live streams.
+- `MAX_MAIN_STREAMS` is the number of main-quality streams allowed at once.
+
 `DVR_HOST` may include a scheme and port, for example
-`http://192.168.1.100:80`. If no scheme is given, `http://` is used.
-`python-dotenv` loads `.env` at runtime. The app never sends the username,
-password, or session id to the browser, and never logs them.
+`http://192.168.1.100:80`. If no scheme is given, `http://` is used. The RTSP
+port is fixed at `554` because that is the measured DVR behaviour; the web port
+in `DVR_HOST` is not reused for RTSP. `python-dotenv` loads `.env` at runtime.
+The app never sends the username, password, RTSP URL, or session id to the
+browser, and never logs them.
 
 ## Run
+
+### Windows development
 
 ```powershell
 uvicorn app:app --reload --host 127.0.0.1 --port 8000
@@ -72,8 +104,77 @@ uvicorn app:app --reload --host 127.0.0.1 --port 8000
 Open <http://127.0.0.1:8000>.
 
 Clicking **Refresh** calls the backend; the browser never talks to the DVR
-directly. Each API request creates its own short-lived DVR session and logs out
-in a `finally` block.
+directly. Each data request creates its own short-lived DVR session and logs out
+in a `finally` block. go2rtc is not run on Windows; the live section is tested
+on the Ubuntu server.
+
+### Ubuntu server
+
+go2rtc must already be running. This app never downloads, installs, starts, or
+stops go2rtc or ffmpeg.
+
+```bash
+cd /path/to/dvr-web
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+Both uvicorn and go2rtc should listen on loopback. For testing from Windows,
+open an SSH tunnel:
+
+```bash
+ssh -L 1984:127.0.0.1:1984 -L 8000:127.0.0.1:8000 USER@SERVER
+```
+
+Then open <http://127.0.0.1:8000> on Windows. The browser loads the web app
+through port `8000` and the go2rtc player through port `1984`, both over the
+tunnel.
+
+**Exposure note:** this phase exposes go2rtc to the browser through the SSH
+tunnel only. Do not bind go2rtc or uvicorn to a public interface. A later phase
+will proxy go2rtc behind authentication.
+
+## Live view behaviour
+
+- One tile per channel (1-4). Only channel 2 currently has a camera, so no
+  channel is hardcoded.
+- **Start** opens the sub stream (`subtype=1`, 352x288) in an iframe using
+  go2rtc's `stream.html?src=<name>&mode=mse`.
+- **Larger view** opens the main stream (`subtype=0`) in a full-width player.
+- **Stop**, **Close larger view**, and the page `pagehide` handler call the close
+  endpoint. The page uses `navigator.sendBeacon` when it is unloading.
+- Streams are registered only while watched. The backend builds the RTSP URL
+  server-side as
+  `rtsp://USER:PASS@HOST:554/cam/realmonitor?channel=N&subtype=S`
+  (`S=1` sub, `S=0` main), URL-encodes the username and password, and sends the
+  result only to go2rtc.
+- The browser receives only an opaque stream name such as `cctv-<random>`; it
+  never receives the RTSP URL or a go2rtc API response.
+- `MAX_LIVE_STREAMS` and `MAX_MAIN_STREAMS` are enforced under a lock. A limit
+  returns HTTP `429` with a clear message, shown in the Live section.
+- A transcoded main stream uses about one CPU core; the server has two. go2rtc
+  stops pulling and transcoding when nobody is watching.
+
+### go2rtc persistence and cleanup
+
+go2rtc writes streams added through its API into its own configuration file,
+including the RTSP source and therefore the DVR credentials. The backend
+therefore:
+
+1. Uses only opaque names with the fixed prefix `cctv-`.
+2. Deletes each stream immediately on close.
+3. On startup, lists go2rtc streams and deletes every leftover whose name starts
+   with `cctv-`. Only response keys are inspected; values are never logged.
+4. On shutdown, deletes every stream it created. A close that failed earlier is
+   retried from the in-memory created set.
+
+If the process is killed without a graceful shutdown, leftovers remain in
+go2rtc's config until the next startup cleanup. Protect the go2rtc config file
+with appropriate permissions; it can contain DVR credentials. Do not commit it
+or paste it into issue reports. Startup cleanup assumes this app is the only
+consumer of the `cctv-` prefix.
 
 ## Test the client
 
@@ -102,10 +203,87 @@ With `--verify-logout`, the client logs out and then makes exactly one
 was rejected (closed), was still accepted, or could not be determined. No retry
 is made.
 
+## Test live view on the Ubuntu server
+
+1. Push from Windows, pull on Ubuntu, and confirm go2rtc is already running:
+
+   ```bash
+   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:1984/api/streams
+   ```
+
+   This prints only the HTTP status. Do not paste the response body; go2rtc
+   stream entries can contain RTSP credentials.
+
+2. Start the app on Ubuntu (loopback only):
+
+   ```bash
+   cd /path/to/dvr-web
+   source .venv/bin/activate
+   uvicorn app:app --host 127.0.0.1 --port 8000
+   ```
+
+3. Open the tunnel from Windows and keep it running:
+
+   ```bash
+   ssh -L 1984:127.0.0.1:1984 -L 8000:127.0.0.1:8000 USER@SERVER
+   ```
+
+4. In the Windows browser open <http://127.0.0.1:8000>. The Live section should
+   show four tiles. `GET /api/config` should return only
+   `{"public_go2rtc_url": "http://127.0.0.1:1984"}`.
+
+5. Click **Start** on channel 2 (the only channel with a camera). The iframe
+   should show the sub stream through go2rtc `mode=mse`. Click **Larger view** on
+   channel 2; the main stream should appear in the full-width player. Click
+   **Close larger view**, then **Stop**.
+
+6. Verify cleanup with a names-only command. This prints only keys, never
+   stream sources:
+
+   ```bash
+   curl -s http://127.0.0.1:1984/api/streams \
+     | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)))'
+   ```
+
+   After Stop and Close, no name starting with `cctv-` should remain.
+
+7. Test the 429 message through the API. Open one main stream:
+
+   ```bash
+   curl -s -X POST 'http://127.0.0.1:8000/api/live/2/open?quality=main'
+   ```
+
+   The response contains only `{"stream_name":"cctv-..."}`. Open a second main
+   stream:
+
+   ```bash
+   curl -s -X POST 'http://127.0.0.1:8000/api/live/2/open?quality=main'
+   ```
+
+   This should return HTTP `429` with the main-stream limit message. To test the
+   total limit, start all four sub tiles in the UI and then click **Larger
+   view**; the Live section should show a clear `429` message. Close the first
+   main stream with the name from step 7:
+
+   ```bash
+   curl -s -X POST 'http://127.0.0.1:8000/api/live/<stream_name>/close'
+   ```
+
+8. Test startup cleanup. Start a stream and confirm a `cctv-` name exists with
+   the names-only command. Stop uvicorn with `Ctrl+C`; graceful shutdown should
+   delete it. To simulate a crash, start a stream again and run
+   `kill -9 <uvicorn-pid>` instead, then start uvicorn again. Startup cleanup
+   should delete the leftover `cctv-` name. Verify with the names-only command.
+
+9. Test page unload. Start a channel, then reload or close the tab. The
+   `pagehide` handler sends a `sendBeacon` close for every active stream; verify
+   that no `cctv-` name remains.
+
 You can also check the web API directly:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/health
+Invoke-RestMethod http://127.0.0.1:8000/api/config
 Invoke-RestMethod http://127.0.0.1:8000/api/device/info
 Invoke-RestMethod http://127.0.0.1:8000/api/channels
 Invoke-RestMethod http://127.0.0.1:8000/api/config/Encode
@@ -120,6 +298,45 @@ Invoke-RestMethod http://127.0.0.1:8000/api/config/Encode
 ```
 
 This is a liveness check only; it does not contact the DVR.
+
+### `GET /api/config`
+
+Returns only the browser-facing go2rtc URL used by the Live view:
+
+```json
+{"public_go2rtc_url": "http://127.0.0.1:1984"}
+```
+
+This is distinct from `GET /api/config/{name}`, which reads DVR configuration.
+It returns no stream sources, credentials, or go2rtc API response.
+
+### `POST /api/live/{channel}/open?quality=sub|main`
+
+Registers one on-demand go2rtc stream. `channel` must be `1`-`4`; `quality`
+defaults to `sub`. The response contains only the opaque stream name:
+
+```json
+{"stream_name": "cctv-<random>"}
+```
+
+The RTSP URL is built server-side and sent only to go2rtc. It is never returned
+or logged. `quality=main` maps to RTSP `subtype=0`; `quality=sub` maps to
+`subtype=1`.
+
+Status codes:
+
+- `400` — channel outside 1-4, or quality not `sub`/`main`.
+- `429` — `MAX_LIVE_STREAMS` or `MAX_MAIN_STREAMS` reached; the message says
+  which limit was hit.
+- `502` — go2rtc could not be reached or rejected the registration.
+- `503` — live view is not configured.
+
+### `POST /api/live/{stream_name}/close`
+
+Deletes one stream. The response is `{"closed": true}`. It is safe to call
+twice: an unknown or already-closed name is treated as closed and is not
+forwarded to go2rtc. A malformed name returns `400`; a go2rtc deletion failure
+returns `502`.
 
 ### `GET /api/device/info`
 
@@ -226,6 +443,14 @@ raw DVR payload.
   heuristic: a secret stored under an innocuous key name would not be caught.
 - This phase is read-only except for session logout. No configuration write/set,
   reboot, factory-reset, or format call exists in the code.
+- The RTSP URL, DVR username/password, and go2rtc API responses stay on the
+  backend. The browser receives only an opaque `cctv-` stream name and the
+  configured `PUBLIC_GO2RTC_URL`.
+- go2rtc persists API-added streams, including their RTSP source with
+  credentials, in its own config. The cleanup rules above remove this app's
+  streams; protect the go2rtc config file and never commit or paste it.
+- go2rtc is exposed to the browser only through the SSH tunnel in this phase. It
+  is not proxied or authenticated by this app yet; do not expose it publicly.
 
 ## Evidence from the sources
 
@@ -333,9 +558,33 @@ used by this phase.
 12. **Object-style factory calls.** The capture shows several
     `*.factory.instance` calls but no request bodies, no `object` field, and no
     factory call around the reads used here. No object helper is used.
+13. **go2rtc list response for startup cleanup.** The cleanup assumes
+    `GET {GO2RTC_URL}/api/streams` returns a JSON object keyed by stream name.
+    That is the documented go2rtc shape but was not verified in this
+    environment; a non-object response is ignored safely.
+14. **go2rtc status codes.** Registration accepts any `2xx`; deletion treats
+    `404` as already gone and accepts any other `2xx`. Exact responses were not
+    confirmed against a live go2rtc.
+15. **RTSP port.** The RTSP URL uses port `554` exactly as measured. The port in
+    `DVR_HOST` is treated as the web port and is not reused for RTSP.
+16. **Transcoding disabled.** With `STREAM_TRANSCODE_H264=false`, the raw RTSP
+    source is sent to go2rtc. This DVR's H.265 streams are expected to be
+    unplayable in the browser; that path was not tested.
+17. **Browser MSE support.** The player uses go2rtc `mode=mse` because WebRTC
+    needs UDP ports that the SSH tunnel does not carry. Actual playback was not
+    tested from this Windows machine.
+18. **CPU and persistence behaviour.** The one-core main-stream estimate and
+    go2rtc's config persistence come from the measured facts supplied with this
+    phase, not from a live run here. The stream limits are count-based, not
+    CPU-aware.
+19. **No live DVR/go2rtc contact in this phase.** All verification used mock
+    HTTP transports. The real RTSP/go2rtc path is unconfirmed until the Ubuntu
+    test below is run.
 
-## Out of scope for Phase 2
+## Out of scope for Phase 3a
 
-Multiple devices, live view/RTSP, playback, configuration writes,
+Multiple devices, playback, configuration writes,
 reboot/factory-reset/format operations, user management, scheduled keepalive,
-and authentication for the web app itself.
+recording, PTZ, and authentication or proxying for go2rtc. The go2rtc player is
+reached through the SSH tunnel; a later phase will put it behind authenticated
+proxying.

@@ -27,8 +27,22 @@ const encodeStatus = document.getElementById("encode-status");
 const encodeTable = document.getElementById("encode-table");
 const encodeRaw = document.getElementById("encode-raw");
 
+const liveStatus = document.getElementById("live-status");
+const liveGrid = document.getElementById("live-grid");
+const liveLarge = document.getElementById("live-large");
+const liveLargeTitle = document.getElementById("live-large-title");
+const liveLargeFrame = document.getElementById("live-large-frame");
+const liveLargeClose = document.getElementById("live-large-close");
+
 const CALL_METADATA_KEYS = new Set(["succeeded_calls", "failed_calls"]);
 const MAX_TABLE_ROWS = 400;
+const LIVE_CHANNELS = [1, 2, 3, 4];
+
+const liveState = {
+  publicUrl: null,
+  tiles: new Map(),
+  large: null,
+};
 
 function formatValue(value) {
   if (value === null || value === undefined) {
@@ -342,9 +356,10 @@ function setLoading(loading) {
   refreshButton.textContent = loading ? "Refreshing…" : "Refresh";
 }
 
-async function fetchJson(url) {
+async function fetchJson(url, options = {}) {
   const response = await fetch(url, {
-    headers: { Accept: "application/json" },
+    ...options,
+    headers: { Accept: "application/json", ...(options.headers || {}) },
     cache: "no-store",
   });
 
@@ -437,10 +452,331 @@ async function loadConfig(name, statusElement, tableElement, rawElement) {
   }
 }
 
+function createLiveTiles() {
+  const fragment = document.createDocumentFragment();
+
+  for (const channel of LIVE_CHANNELS) {
+    const tile = document.createElement("article");
+    tile.className = "live-tile";
+    tile.dataset.channel = String(channel);
+
+    const head = document.createElement("div");
+    head.className = "live-tile-head";
+
+    const title = document.createElement("h3");
+    title.textContent = `Channel ${channel}`;
+
+    const badge = document.createElement("span");
+    badge.className = "live-badge";
+    badge.textContent = "Idle";
+    head.append(title, badge);
+
+    const frame = document.createElement("div");
+    frame.className = "live-frame";
+    frame.append(emptyNode("Not started."));
+
+    const actions = document.createElement("div");
+    actions.className = "live-actions";
+
+    const start = document.createElement("button");
+    start.type = "button";
+    start.className = "button button-small";
+    start.textContent = "Start";
+    start.addEventListener("click", () => startTile(channel));
+
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.className = "button button-ghost button-small";
+    stop.textContent = "Stop";
+    stop.disabled = true;
+    stop.addEventListener("click", () => stopTile(channel));
+
+    const large = document.createElement("button");
+    large.type = "button";
+    large.className = "button button-ghost button-small";
+    large.textContent = "Larger view";
+    large.addEventListener("click", () => openLarge(channel));
+
+    actions.append(start, stop, large);
+
+    const status = document.createElement("p");
+    status.className = "section-note";
+    status.setAttribute("role", "status");
+    status.textContent = "Idle.";
+
+    tile.append(head, frame, actions, status);
+    fragment.append(tile);
+
+    liveState.tiles.set(channel, {
+      name: null,
+      quality: null,
+      frame,
+      badge,
+      start,
+      stop,
+      large,
+      status,
+    });
+  }
+
+  liveGrid.replaceChildren(fragment);
+}
+
+function setTileStatus(channel, state, message) {
+  const tile = liveState.tiles.get(channel);
+  if (!tile) {
+    return;
+  }
+  tile.status.className = `section-note ${state}`;
+  tile.status.textContent = message;
+}
+
+function updateLiveButtons() {
+  for (const tile of liveState.tiles.values()) {
+    const active = Boolean(tile.name);
+    tile.start.disabled = active || !liveState.publicUrl;
+    tile.stop.disabled = !active;
+    tile.large.disabled = !liveState.publicUrl;
+  }
+  liveLargeClose.disabled = !liveState.large;
+}
+
+function playerUrl(name) {
+  return `${liveState.publicUrl}/stream.html?src=${encodeURIComponent(
+    name,
+  )}&mode=mse`;
+}
+
+function buildLiveFrame(name, title) {
+  const iframe = document.createElement("iframe");
+  iframe.className = "live-iframe";
+  iframe.title = title;
+  iframe.allow = "autoplay; fullscreen";
+  iframe.setAttribute("allowfullscreen", "");
+  iframe.src = playerUrl(name);
+  return iframe;
+}
+
+function sendCloseBeacon(name) {
+  const url = `/api/live/${encodeURIComponent(name)}/close`;
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon(url);
+    return;
+  }
+  fetch(url, { method: "POST", keepalive: true }).catch(() => {});
+}
+
+async function closeStream(name) {
+  await fetchJson(`/api/live/${encodeURIComponent(name)}/close`, {
+    method: "POST",
+  });
+}
+
+async function startTile(channel) {
+  const tile = liveState.tiles.get(channel);
+  if (!tile || tile.name) {
+    return;
+  }
+  if (!liveState.publicUrl) {
+    setTileStatus(channel, "error", "Live view is not configured.");
+    return;
+  }
+
+  tile.start.disabled = true;
+  setTileStatus(channel, "loading", "Opening sub stream…");
+
+  try {
+    const payload = await fetchJson(
+      `/api/live/${channel}/open?quality=sub`,
+      { method: "POST" },
+    );
+    const name = payload?.stream_name;
+    if (typeof name !== "string" || name === "") {
+      throw new Error("The server did not return a stream name.");
+    }
+
+    tile.name = name;
+    tile.quality = "sub";
+    tile.frame.replaceChildren(
+      buildLiveFrame(name, `Channel ${channel} sub stream`),
+    );
+    tile.badge.textContent = "Live";
+    tile.badge.className = "live-badge live";
+    setTileStatus(channel, "ok", "Sub stream playing.");
+  } catch (error) {
+    tile.frame.replaceChildren(emptyNode("Not started."));
+    tile.badge.textContent = "Idle";
+    tile.badge.className = "live-badge";
+    setTileStatus(
+      channel,
+      "error",
+      error.message || "Could not start the live stream.",
+    );
+  } finally {
+    updateLiveButtons();
+  }
+}
+
+async function stopTile(channel) {
+  const tile = liveState.tiles.get(channel);
+  if (!tile || !tile.name) {
+    return;
+  }
+
+  const name = tile.name;
+  tile.name = null;
+  tile.quality = null;
+  tile.stop.disabled = true;
+  setTileStatus(channel, "loading", "Stopping…");
+
+  try {
+    await closeStream(name);
+    setTileStatus(channel, "ok", "Stopped.");
+  } catch (error) {
+    setTileStatus(
+      channel,
+      "error",
+      error.message || "Could not stop the stream.",
+    );
+  } finally {
+    tile.frame.replaceChildren(emptyNode("Not started."));
+    tile.badge.textContent = "Idle";
+    tile.badge.className = "live-badge";
+    updateLiveButtons();
+  }
+}
+
+function clearLargeView() {
+  liveState.large = null;
+  liveLarge.hidden = true;
+  liveLargeFrame.replaceChildren();
+  updateLiveButtons();
+}
+
+async function openLarge(channel) {
+  if (!liveState.publicUrl) {
+    setSectionNote(liveStatus, "error", "Live view is not configured.");
+    return;
+  }
+
+  setSectionNote(
+    liveStatus,
+    "loading",
+    `Opening main stream for channel ${channel}…`,
+  );
+
+  if (liveState.large) {
+    try {
+      await closeStream(liveState.large.name);
+    } catch (error) {
+      setSectionNote(
+        liveStatus,
+        "error",
+        error.message || "Could not close the previous larger view.",
+      );
+      return;
+    }
+    clearLargeView();
+  }
+
+  try {
+    const payload = await fetchJson(
+      `/api/live/${channel}/open?quality=main`,
+      { method: "POST" },
+    );
+    const name = payload?.stream_name;
+    if (typeof name !== "string" || name === "") {
+      throw new Error("The server did not return a stream name.");
+    }
+
+    liveState.large = { name, channel };
+    liveLargeFrame.replaceChildren(
+      buildLiveFrame(name, `Channel ${channel} main stream`),
+    );
+    liveLargeTitle.textContent = `Channel ${channel} — main stream`;
+    liveLarge.hidden = false;
+    updateLiveButtons();
+    setSectionNote(
+      liveStatus,
+      "ok",
+      `Larger view is playing channel ${channel} main stream.`,
+    );
+  } catch (error) {
+    setSectionNote(
+      liveStatus,
+      "error",
+      error.message || "Could not open the larger view.",
+    );
+  }
+}
+
+async function closeLarge() {
+  const large = liveState.large;
+  if (!large) {
+    return;
+  }
+
+  try {
+    await closeStream(large.name);
+    setSectionNote(liveStatus, "ok", "Larger view closed.");
+  } catch (error) {
+    setSectionNote(
+      liveStatus,
+      "error",
+      error.message || "Could not close the larger view.",
+    );
+  } finally {
+    clearLargeView();
+  }
+}
+
+function closeAllOnUnload() {
+  const names = new Set();
+  for (const tile of liveState.tiles.values()) {
+    if (tile.name) {
+      names.add(tile.name);
+    }
+  }
+  if (liveState.large) {
+    names.add(liveState.large.name);
+  }
+  for (const name of names) {
+    sendCloseBeacon(name);
+  }
+}
+
+async function loadLiveConfig() {
+  setSectionNote(liveStatus, "loading", "Loading live-view configuration…");
+
+  try {
+    const payload = await fetchJson("/api/config");
+    const url = payload?.public_go2rtc_url;
+    if (typeof url !== "string" || !/^https?:\/\//.test(url)) {
+      throw new Error("The server did not return a usable go2rtc URL.");
+    }
+    liveState.publicUrl = url.replace(/\/+$/, "");
+    setSectionNote(
+      liveStatus,
+      "ok",
+      "Start a channel to open an on-demand stream.",
+    );
+  } catch (error) {
+    liveState.publicUrl = null;
+    setSectionNote(
+      liveStatus,
+      "error",
+      error.message || "Could not load live-view configuration.",
+    );
+  }
+
+  updateLiveButtons();
+}
+
 async function loadAll() {
   setLoading(true);
   // Sequential requests: one short-lived DVR session at a time, so a DVR that
   // limits concurrent sessions is not asked to hold four logins at once.
+  await loadLiveConfig();
   await loadDeviceInfo();
   await loadChannels();
   await loadConfig("Network", networkStatus, networkTable, networkRaw);
@@ -449,4 +785,8 @@ async function loadAll() {
 }
 
 refreshButton.addEventListener("click", loadAll);
+liveLargeClose.addEventListener("click", closeLarge);
+window.addEventListener("pagehide", closeAllOnUnload);
+createLiveTiles();
+updateLiveButtons();
 loadAll();
