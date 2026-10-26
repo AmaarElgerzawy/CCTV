@@ -272,6 +272,149 @@ h2 {
   font-size: 14px;
 }
 
+.badge {
+  flex: none;
+  border-radius: 999px;
+  padding: 5px 12px;
+  color: var(--accent-dark);
+  background: var(--accent-soft);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.section-note {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.section-note.ok {
+  color: var(--ok);
+}
+
+.section-note.warn {
+  color: #92400e;
+}
+
+.section-note.error {
+  color: var(--danger);
+}
+
+.name-list {
+  margin: 0 0 16px;
+}
+
+.name-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.name-items li {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: #f8fafb;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.table-wrap {
+  margin: 0 0 16px;
+  overflow-x: auto;
+}
+
+.config-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.config-table th,
+.config-table td {
+  border-top: 1px solid var(--border);
+  padding: 9px 12px;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.config-table thead th {
+  border-top: 0;
+  color: var(--muted);
+  background: #f8fafb;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.config-table tbody th {
+  width: 42%;
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.config-table tbody tr:first-child th,
+.config-table tbody tr:first-child td {
+  border-top: 0;
+}
+
+.config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.config-block {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px;
+  background: #fcfdfd;
+}
+
+.config-block h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  letter-spacing: -0.01em;
+}
+
+.subraw {
+  margin-top: 6px;
+}
+
+.subraw summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.subraw summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.subraw pre {
+  margin: 12px 0 0;
+  border-radius: 10px;
+  padding: 14px;
+  background: #f6f7f9;
+  color: #303740;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow: auto;
+  max-height: 260px;
+}
+
 .raw summary {
   cursor: pointer;
   font-size: 14px;
@@ -312,6 +455,10 @@ h2 {
 @media (max-width: 880px) {
   .summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .config-grid {
+    grid-template-columns: 1fr;
   }
 }
 

@@ -1,8 +1,9 @@
-"""Manual smoke test: log in, read device identity, log out.
+"""Manual smoke test: log in, read device identity, channels and config, log out.
 
-Output contains the four non-sensitive device fields plus per-call success and
-failure metadata. It never includes the password, session id, or any get2DCode
-value. Run with the project's virtualenv active:
+Output contains non-sensitive device fields, channel counts/titles, and masked
+config tables plus per-call success and failure metadata. It never includes the
+password, session id, or any get2DCode value. Run with the project's virtualenv
+active:
 
     python test_dvr.py
     python test_dvr.py --verify-logout
@@ -12,7 +13,7 @@ import argparse
 import json
 import sys
 
-from dvr_client import DvrClient, DvrError
+from dvr_client import DvrClient, DvrError, mask_sensitive
 
 
 def _report_verification(result: bool | None) -> int:
@@ -62,6 +63,20 @@ def main(argv: list[str] | None = None) -> int:
         info = dvr.get_device_info()
         print("Device info:")
         print(json.dumps(info, indent=2, sort_keys=True, ensure_ascii=False))
+
+        channels = dvr.get_channels()
+        print("Channels:")
+        print(json.dumps(channels, indent=2, sort_keys=True, ensure_ascii=False))
+
+        # Only the two config areas requested for this phase. A rejected read
+        # is reported in failed_calls and does not stop the remaining reads.
+        for name in ("Encode", "Network"):
+            config = dvr.get_config(name)
+            config["table"] = mask_sensitive(config.get("table"))
+            print(f"{name} config:")
+            print(
+                json.dumps(config, indent=2, sort_keys=True, ensure_ascii=False)
+            )
 
         if args.verify_logout:
             if not dvr.is_logged_in:

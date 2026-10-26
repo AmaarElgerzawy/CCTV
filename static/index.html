@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DVR Device Info</title>
+  <title>DVR Dashboard</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -11,10 +11,10 @@
     <header class="topbar">
       <div>
         <p class="eyebrow">Local network</p>
-        <h1>DVR device information</h1>
+        <h1>DVR overview</h1>
         <p class="lede">
-          Device type, class, software version, and build date reported by the
-          recorder. This view is read-only.
+          Read-only device identity, video input channels, and selected
+          configuration from the recorder.
         </p>
       </div>
       <button id="refresh" class="button" type="button">Refresh</button>
@@ -57,6 +57,47 @@
       <dl id="details" class="details">
         <div class="empty">No fields to display.</div>
       </dl>
+    </section>
+
+    <section class="panel" aria-labelledby="channels-title">
+      <div class="panel-head">
+        <h2 id="channels-title">Channels</h2>
+        <span id="channel-count" class="badge">—</span>
+      </div>
+      <p id="channels-status" class="section-note">Loading channels…</p>
+      <div id="channel-names" class="name-list"></div>
+      <div id="channel-counts" class="table-wrap"></div>
+      <details class="subraw">
+        <summary>Raw channels response</summary>
+        <pre id="channels-raw">—</pre>
+      </details>
+    </section>
+
+    <section class="panel" aria-labelledby="settings-title">
+      <div class="panel-head">
+        <h2 id="settings-title">Settings</h2>
+        <span class="muted">Read-only configuration</span>
+      </div>
+      <div class="config-grid">
+        <article class="config-block">
+          <h3>Network</h3>
+          <p id="network-status" class="section-note">Loading…</p>
+          <div id="network-table" class="table-wrap"></div>
+          <details class="subraw">
+            <summary>Raw Network response</summary>
+            <pre id="network-raw">—</pre>
+          </details>
+        </article>
+        <article class="config-block">
+          <h3>Encode</h3>
+          <p id="encode-status" class="section-note">Loading…</p>
+          <div id="encode-table" class="table-wrap"></div>
+          <details class="subraw">
+            <summary>Raw Encode response</summary>
+            <pre id="encode-raw">—</pre>
+          </details>
+        </article>
+      </div>
     </section>
 
     <details class="panel raw">

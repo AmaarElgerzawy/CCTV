@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from typing import Any
 
 import httpx
@@ -18,6 +19,22 @@ _RPC2_PATH = "/RPC2"
 _LOGIN_PATH = "/RPC2_Login"
 _LOGOUT_METHOD = "global.logout"
 _LOGOUT_PROBE_METHOD = "global.keepAlive"
+
+_CHANNEL_COUNT_METHOD = "LogicDeviceManager.getVideoInputChannels"
+_CHANNEL_INFO_METHOD = "LogicDeviceManager.getVideoChannelsInfo"
+_CONFIG_METHOD = "configManager.getConfig"
+
+# Config reads that are allowed by the API. Encode and Network are documented
+# only by api_spec.md, not by the current har_summary.txt; Network is an
+# unconfirmed read name suggested by api_spec.md. WorkGroupMode is excluded
+# because it returned an error in the capture.
+# TODO(spec): confirm the Network and Encode config names on the device.
+CONFIG_NAMES: tuple[str, ...] = (
+    "Encode",
+    "Network",
+    "VideoStandard",
+    "Locales",
+)
 
 # TODO(spec): api_spec.md confirms POST /RPC2_Login rpc=global.login and its
 # response fields, but not the request-side credential fields or their values.
@@ -160,6 +177,96 @@ def _info_type(payload: dict[str, Any]) -> str:
     return "other"
 
 
+_SENSITIVE_FIELD = re.compile(r"(?i)(password|passwd|pwd|key|secret|token)")
+_NAME_KEYS = frozenset(
+    {
+        "name",
+        "title",
+        "channelname",
+        "channeltitle",
+        "channel_name",
+        "channel_title",
+    }
+)
+
+
+def mask_sensitive(value: Any) -> Any:
+    """Recursively replace values whose field name looks sensitive.
+
+    Only dict keys are inspected. Lists keep their shape. This is applied at
+    the API boundary and by the smoke test, so a masked value is never returned
+    to the browser or printed.
+    """
+    if isinstance(value, dict):
+        masked: dict[Any, Any] = {}
+        for key, item in value.items():
+            if _SENSITIVE_FIELD.search(str(key)):
+                masked[key] = "***"
+            else:
+                masked[key] = mask_sensitive(item)
+        return masked
+    if isinstance(value, list):
+        return [mask_sensitive(item) for item in value]
+    return value
+
+
+def _extract_channel_names(output: Any) -> list[str]:
+    """Best-effort extraction of channel titles from params.Output.
+
+    api_spec.md records only the params.Output key, not its shape, so this
+    accepts the common list/dict layouts and returns an empty list rather than
+    inventing values. TODO(spec): confirm the real getVideoChannelsInfo shape.
+    """
+    names: list[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            if text and text not in names:
+                names.append(text)
+
+    def walk(node: Any, *, allow_strings: bool = False) -> None:
+        if isinstance(node, dict):
+            if (
+                node
+                and all(isinstance(item, str) for item in node.values())
+                and all(str(key).isdigit() for key in node)
+            ):
+                for item in node.values():
+                    add(item)
+                return
+            for key, item in node.items():
+                lowered = str(key).lower()
+                if lowered in _NAME_KEYS:
+                    add(item)
+                else:
+                    walk(
+                        item,
+                        allow_strings=lowered
+                        in {"channels", "names", "titles", "output"},
+                    )
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, str):
+                    if allow_strings:
+                        add(item)
+                else:
+                    walk(item, allow_strings=allow_strings)
+        elif allow_strings:
+            add(node)
+
+    if isinstance(output, str):
+        add(output)
+    elif isinstance(output, list) and all(
+        isinstance(item, str) for item in output
+    ):
+        for item in output:
+            add(item)
+    else:
+        walk(output)
+    return names
+
+
 def _rpc_diagnostic(method: str, status: int, payload: dict[str, Any]) -> str:
     """Describe an RPC failure using names and types only, never values."""
     code = _error_code(payload)
@@ -205,6 +312,9 @@ _DATA_RETURNING_METHODS = frozenset(
         "magicBox.getDeviceClass",
         "magicBox.getSoftwareVersion",
         "magicBox.getProductDefinition",
+        _CHANNEL_COUNT_METHOD,
+        _CHANNEL_INFO_METHOD,
+        _CONFIG_METHOD,
     }
 )
 
@@ -464,6 +574,101 @@ class DvrClient:
 
         return info
 
+    def get_channels(self) -> dict[str, Any]:
+        """Read the video input channel count and, if available, channel titles.
+
+        The count comes from LogicDeviceManager.getVideoInputChannels and its
+        params.channelCountInfo, as recorded in har_summary.txt lines 7-8.
+        Titles come from LogicDeviceManager.getVideoChannelsInfo, which
+        api_spec.md names but the current capture does not contain.
+
+        Each call is isolated. Failed entries contain only the method name and
+        error code -- never a response value.
+        """
+        channels: dict[str, Any] = {
+            "count": None,
+            "count_info": None,
+            "names": [],
+            "titles_status": "not-attempted",
+            "succeeded_calls": [],
+            "failed_calls": [],
+        }
+
+        # The capture records params: null for this call.
+        try:
+            payload = self._rpc(_CHANNEL_COUNT_METHOD, null_params=True)
+        except DvrRpcError as exc:
+            channels["failed_calls"].append(
+                {"method": _CHANNEL_COUNT_METHOD, "error_code": exc.code}
+            )
+        else:
+            params = payload.get("params")
+            count_info = (
+                params.get("channelCountInfo")
+                if isinstance(params, dict)
+                else None
+            )
+            if isinstance(count_info, dict):
+                channels["count_info"] = count_info
+                count = count_info.get("CurTotal")
+                if isinstance(count, int) and not isinstance(count, bool):
+                    channels["count"] = count
+            channels["succeeded_calls"].append(_CHANNEL_COUNT_METHOD)
+
+        # TODO(spec): the request shape for getVideoChannelsInfo is not
+        # documented. An empty params object is the smallest assumption.
+        try:
+            payload = self._rpc(_CHANNEL_INFO_METHOD)
+        except DvrRpcError as exc:
+            channels["failed_calls"].append(
+                {"method": _CHANNEL_INFO_METHOD, "error_code": exc.code}
+            )
+            channels["titles_status"] = "failed"
+        else:
+            params = payload.get("params")
+            output = params.get("Output") if isinstance(params, dict) else None
+            channels["names"] = _extract_channel_names(output)
+            channels["titles_status"] = (
+                "ok" if channels["names"] else "empty"
+            )
+            channels["succeeded_calls"].append(_CHANNEL_INFO_METHOD)
+
+        return channels
+
+    def get_config(self, name: str) -> dict[str, Any]:
+        """Read one allow-listed configManager.getConfig table.
+
+        A rejected call is reported as a failed call with the method name and
+        error code only; it does not raise, so the caller can still show the
+        rest of the page. Session and transport errors still propagate.
+        """
+        if name not in CONFIG_NAMES:
+            raise ValueError("Unsupported config name")
+
+        config: dict[str, Any] = {
+            "name": name,
+            "table": None,
+            "succeeded_calls": [],
+            "failed_calls": [],
+        }
+
+        # TODO(spec): the capture records name and onlyLocal request keys, but
+        # not their values or whether onlyLocal is required. This sends only
+        # the documented name, which is the smallest assumption.
+        try:
+            payload = self._rpc(_CONFIG_METHOD, {"name": name})
+        except DvrRpcError as exc:
+            config["failed_calls"].append(
+                {"method": _CONFIG_METHOD, "error_code": exc.code}
+            )
+            return config
+
+        params = payload.get("params")
+        if isinstance(params, dict):
+            config["table"] = params.get("table")
+        config["succeeded_calls"].append(_CONFIG_METHOD)
+        return config
+
     def _probe_closed_session(self, session: str) -> bool | None:
         """Check whether the DVR rejects an old session.
 
@@ -565,13 +770,20 @@ class DvrClient:
         if not self._session_id:
             raise DvrSessionExpired("No active DVR session; call login() first")
 
-    def _rpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _rpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        null_params: bool = False,
+    ) -> dict[str, Any]:
         self._require_session()
+        body_params = None if null_params else (params or {})
         try:
             status, payload = self._post(
                 _RPC2_PATH,
                 method,
-                params or {},
+                body_params,
                 session=self._session_id,
             )
         except _DvrHttpError as exc:
