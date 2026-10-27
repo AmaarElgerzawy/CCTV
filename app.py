@@ -3,10 +3,10 @@ import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager, contextmanager, suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import date as date_cls, datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Iterator
+from typing import Any, AsyncIterator, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -304,7 +304,7 @@ async def _resolve_device(
     registry = _registry(request)
     try:
         return await asyncio.to_thread(registry.resolve_device, device_id)
-    except RegistryError as exc:
+    except RegistryError:
         raise
 
 
@@ -415,11 +415,9 @@ async def channels(request: Request) -> JSONResponse:
         return _registry_error(exc)
 
     now = time.monotonic()
-    cache_key = ("channels", device_id)
     if device_id is not None:
         cached = _DEVICE_INFO_CACHE.get(device_id)
         if cached is not None and now < cached[0]:
-            # We store info separately; also cache channels in separate structure
             pass
 
     try:
@@ -1135,10 +1133,6 @@ async def refresh_status(request: Request) -> JSONResponse:
     except Exception as exc:
         return _registry_error(exc)
     return JSONResponse(result)
-# helper will be added
-import traceback
-
-
 def log_unexpected(logger, message: str, exc: Exception) -> None:
     exc_type = type(exc).__name__
     if exc_type in ("NameError", "UnboundLocalError"):

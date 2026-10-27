@@ -1,8 +1,6 @@
 """Regression tests for device_id path through the API."""
 from __future__ import annotations
 
-import asyncio
-import json
 import os
 import tempfile
 import unittest
@@ -14,7 +12,6 @@ from cryptography.fernet import Fernet
 
 import app as app_module
 import cgi_client
-import registry as registry_module
 from registry import DeviceRegistry, RegistrySettings
 
 

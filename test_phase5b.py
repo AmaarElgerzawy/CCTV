@@ -6,9 +6,6 @@ Run with:
 
 from __future__ import annotations
 
-import asyncio
-import json
-import logging
 import os
 import tempfile
 import unittest
@@ -20,7 +17,6 @@ from cryptography.fernet import Fernet
 
 import app as app_module
 import cgi_client
-import registry as registry_module
 import stream_manager
 from registry import DeviceRegistry, RegistrySettings, ResolvedDevice
 
