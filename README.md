@@ -1,4 +1,4 @@
-# DVR Web — Phase 5a
+# DVR Web — Phase 5b
 
 A small, read-only web app for Dahua DVRs on the local network. It logs in to
 a DVR, reads device identity, video input channels, and selected configuration,
@@ -8,10 +8,9 @@ storage health through the DVR HTTP CGI API. Phase 4b adds recorded playback
 through go2rtc from a clip or a timeline time, still read-only on the DVR.
 Phase 5a adds a local device registry: groups, up to hundreds of recorders,
 encrypted per-device credentials with a default fallback, CSV import, and a
-TCP-only online-status checker.
-
-The Live, Recordings, and Settings pages still use `DVR_HOST`/`DVR_USER`/
-`DVR_PASS`. Linking them to a selected registry device is the next phase.
+TCP-only online-status checker. Phase 5b links the dashboard (Live, Recordings,
+Settings) to a registry-selected device with per-device limits, device-aware
+stream management, and lazy loading for configuration sections.
 
 All DVR API behavior is based strictly on [`api_spec.md`](api_spec.md) and the
 current `har_summary.txt`. Points that the sources do not document are marked as
@@ -32,12 +31,16 @@ do not use the RPC session either. No media is downloaded.
 | `cgi_client.py` | Read-only DVR CGI client: device clock, `findFile`/`findNextFile` paging, `close`/`destroy` cleanup, storage health, recording cache, and per-device lock |
 | `stream_manager.py` | On-demand go2rtc live and recorded-playback streams, leases, limits, and cleanup; builds the RTSP URLs server-side |
 | `registry.py` | Phase 5a device registry: settings, SQLite storage, Fernet credentials, groups/devices, CSV import, first-run migration, connection test, and the TCP status checker |
-| `app.py` | FastAPI app: `/`, `/devices`, `/health`, `/api/device/info`, `/api/channels`, `/api/config` (live config), `/api/config/{name}` (DVR config), `/api/live/{channel}/open`, `/api/live/renew`, `/api/live/{stream_name}/close`, `/api/playback/open`, `/api/recordings`, `/api/recordings/time`, `/api/storage`, the registry API, plus the lease reaper and status checker |
-| `static/` | Plain HTML/CSS/JS frontend (no build step), including Live, Recordings, playback, and the Devices page |
+| `app.py` | FastAPI app: `/`, `/devices`, `/health`, `/api/device/info`, `/api/channels`, `/api/config` (live config), `/api/config/{name}` (DVR config), `/api/live/{channel}/open`, `/api/live/renew`, `/api/live/{stream_name}/close`, `/api/playback/open`, `/api/recordings`, `/api/recordings/time`, `/api/storage`, the registry API (`/api/devices/*`), plus the lease reaper and status checker; Phase 5b adds device resolution, per-device locks/caches, per-device stream limits, and `POST /api/devices/{id}/streams/close-all` |
+| `static/` | Plain HTML/CSS/JS frontend (no build step), including Live, Recordings, playback, and the Devices page; Phase 5b adds device selector/header, per-device lazy loading, and per-device Include keys |
 | `static/playback_clips.js` | Pure clip-navigation helpers (`daySeconds`, `clipStarts`, `adjacentClipStart`) shared by the browser and a Node test |
-| `static/devices.html`, `static/devices.js` | Phase 5a registry page: counters, search/state filter, grouped devices, CRUD, default credentials, CSV preview/import, status refresh |
+| `static/device_selector.js` | Pure device selector helpers (shared by browser and Node test) |
+| `static/devices.html`, `static/devices.js` | Phase 5a registry page: counters, search/state filter, grouped devices, CRUD, default credentials, CSV preview/import, status refresh; Phase 5b adds an "Open" button linking to `/?device=<id>` |
 | `test_dvr.py` | Manual login → device/channels/config reads → logout smoke test |
 | `test_registry.py` | Offline unittest suite for Phase 5a (mock transports, fake sockets, temp SQLite) |
+| `test_phase5b.py` | Offline tests for Phase 5b device resolution and per-device stream limits |
+| `test_phase5b_regression.py` | Regression tests for device_id path through recordings/time/storage with mocks |
+| `test_device_selector.js` | Node tests for pure device selector helpers |
 | `.env.example` | Placeholder configuration to copy to `.env` |
 | `api_spec.md` | DVR API notes this implementation is based on |
 
@@ -144,6 +147,14 @@ STATUS_INTERVAL_SECONDS=60
 STATUS_CONCURRENCY=10
 STATUS_TIMEOUT_SECONDS=2
 ALLOW_PUBLIC_HOSTS=false
+```
+
+Phase 5b adds these settings (safe defaults):
+
+```dotenv
+DEVICE_INFO_CACHE_SECONDS=60
+MAX_STREAMS_PER_DEVICE=4
+MAX_MAIN_PER_DEVICE=1
 ```
 
 Generate the Fernet key once, then paste only the value:

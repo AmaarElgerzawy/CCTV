@@ -206,7 +206,7 @@ async def _read_device_resolved(
     except DvrError as exc:
         return _dvr_error(exc)
     except Exception as exc:
-        logger.error("Unexpected error while reading DVR data: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected error while reading DVR data", exc)
         return _error(500, "Unexpected server error.")
 
 
@@ -240,8 +240,7 @@ def _read_device(
     except DvrError as exc:
         return _dvr_error(exc)
     except Exception as exc:  # pragma: no cover - defensive
-        # Log the type only; exception strings can contain upstream data.
-        logger.error("Unexpected error while reading DVR data: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected error while reading DVR data", exc)
         return _error(500, "Unexpected server error.")
 
 
@@ -404,7 +403,7 @@ async def device_info(request: Request) -> JSONResponse:
     except DvrError as exc:
         return _dvr_error(exc)
     except Exception as exc:
-        logger.error("Unexpected error while reading DVR data: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected error while reading DVR data", exc)
         return _error(500, "Unexpected server error.")
 
 
@@ -447,7 +446,7 @@ async def channels(request: Request) -> JSONResponse:
     except DvrError as exc:
         return _dvr_error(exc)
     except Exception as exc:
-        logger.error("Unexpected error while reading DVR data: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected error while reading DVR data", exc)
         return _error(500, "Unexpected server error.")
 
 
@@ -514,7 +513,7 @@ async def open_live(
         logger.warning("Live stream registration failed: %s", exc)
         return _error(502, "Could not start the live stream.")
     except Exception as exc:  # defensive: never expose an upstream response
-        logger.error("Unexpected live-stream error: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected live-stream error", exc)
         return _error(500, "Unexpected server error.")
 
     return JSONResponse({"stream_name": stream_name})
@@ -547,7 +546,7 @@ async def renew_live(request: Request) -> JSONResponse:
         logger.warning("Live view is not configured: %s", exc)
         return _error(503, str(exc))
     except Exception as exc:  # defensive: never expose an upstream response
-        logger.error("Unexpected lease-renewal error: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected lease-renewal error", exc)
         return _error(500, "Unexpected server error.")
 
     return JSONResponse({"renewed": renewed, "expired": expired})
@@ -568,7 +567,7 @@ def close_live(stream_name: str, request: Request) -> JSONResponse:
         logger.warning("Live stream removal failed: %s", exc)
         return _error(502, "Could not stop the live stream.")
     except Exception as exc:  # defensive: never expose an upstream response
-        logger.error("Unexpected live-stream error: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected live-stream error", exc)
         return _error(500, "Unexpected server error.")
 
     return JSONResponse({"closed": True})
@@ -640,7 +639,7 @@ async def open_playback(request: Request) -> JSONResponse:
     except CgiError as exc:
         return _cgi_error(exc)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.error("Unexpected CGI clock error: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected CGI clock error", exc)
         return _error(500, "Unexpected server error.")
 
     try:
@@ -668,7 +667,7 @@ async def open_playback(request: Request) -> JSONResponse:
         logger.warning("Playback stream registration failed: %s", exc)
         return _error(502, "Could not start playback.")
     except Exception as exc:  # defensive: never expose an upstream response
-        logger.error("Unexpected playback error: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected playback error", exc)
         return _error(500, "Unexpected server error.")
 
     return JSONResponse({"stream_name": stream_name})
@@ -681,31 +680,29 @@ async def recordings_time(request: Request) -> JSONResponse:
         device_id = _device_id_from_query(request)
     except RegistryError as exc:
         return _registry_error(exc)
+    device_time = None
+    source = "server"
     try:
         registry = _registry(request)
         resolved = await asyncio.to_thread(registry.resolve_device, device_id)
-        async with _open_cgi() as client:
-            client._http = client._http  # keep existing
-            # Use a new client built from resolved creds would be better, but easier to pass via env is not possible
-            # Instead, create DvrCgi with resolved
-            from cgi_client import DvrCgi
+        from cgi_client import DvrCgi
 
-            cgi = DvrCgi(
-                resolved.base_url,
-                resolved.username,
-                resolved.password,
-                device_id=resolved.id,
-            )
-            try:
-                device_time, source = await _device_clock(cgi)
-            finally:
-                await cgi.aclose()
+        cgi = DvrCgi(
+            resolved.base_url,
+            resolved.username,
+            resolved.password,
+            device_id=resolved.id,
+        )
+        try:
+            device_time, source = await _device_clock(cgi)
+        finally:
+            await cgi.aclose()
     except RegistryError as exc:
         return _registry_error(exc)
     except CgiError as exc:
         return _cgi_error(exc)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.error("Unexpected CGI clock error: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected CGI clock error", exc)
         return _error(500, "Unexpected server error.")
     return JSONResponse({"device_time": device_time, "source": source})
 
@@ -744,6 +741,8 @@ async def recordings(
             400, f"channel must be between 1 and {max_channel}."
         )
 
+    device_time = None
+    source = "device"
     try:
         registry = _registry(request)
         resolved = await asyncio.to_thread(registry.resolve_device, device_id)
@@ -772,7 +771,7 @@ async def recordings(
     except CgiError as exc:
         return _cgi_error(exc)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.error("Unexpected CGI recordings error: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected CGI recordings error", exc)
         return _error(500, "Unexpected server error.")
 
     context = {
@@ -835,8 +834,8 @@ async def storage(request: Request) -> JSONResponse:
         )
     except Exception as exc:  # pragma: no cover - defensive
         logger.error(
-            "Unexpected storage-health error: %s", type(exc).__name__
         )
+        log_unexpected(logger, "Unexpected storage-health error", exc)
         return JSONResponse(
             {"health": "unknown", "disks": 0, "errors": 0}
         )
@@ -877,7 +876,7 @@ async def config(name: str, request: Request) -> JSONResponse:
     except DvrError as exc:
         return _dvr_error(exc)
     except Exception as exc:
-        logger.error("Unexpected error while reading DVR data: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected error while reading DVR data", exc)
         return _error(500, "Unexpected server error.")
 
 
@@ -907,7 +906,7 @@ def _registry_error(exc: Exception) -> JSONResponse:
         return _error(503, REGISTRY_DISABLED_MESSAGE)
     if isinstance(exc, RegistryError):
         return _error(exc.status_code, str(exc))
-    logger.error("Unexpected registry error: %s", type(exc).__name__)
+    log_unexpected(logger, "Unexpected registry error", exc)
     return _error(500, "Unexpected server error.")
 
 
@@ -1056,7 +1055,7 @@ async def close_device_streams(device_id: int, request: Request) -> JSONResponse
         logger.warning("Live view is not configured: %s", exc)
         return _error(503, str(exc))
     except Exception as exc:
-        logger.error("Unexpected close-all error: %s", type(exc).__name__)
+        log_unexpected(logger, "Unexpected close-all error", exc)
         return _error(500, "Unexpected server error.")
 
 
@@ -1136,3 +1135,30 @@ async def refresh_status(request: Request) -> JSONResponse:
     except Exception as exc:
         return _registry_error(exc)
     return JSONResponse(result)
+# helper will be added
+import traceback
+
+
+def log_unexpected(logger, message: str, exc: Exception) -> None:
+    exc_type = type(exc).__name__
+    if exc_type in ("NameError", "UnboundLocalError"):
+        try:
+            logger.error("%s %s: %s", message, exc_type, str(exc))
+        except Exception:
+            logger.error("%s %s", message, exc_type)
+        return
+    frames = []
+    try:
+        tb = exc.__traceback__
+        while tb is not None:
+            frame = tb.tb_frame
+            code = frame.f_code
+            frames.append(f"{code.co_filename}:{tb.tb_lineno}:{code.co_name}")
+            tb = tb.tb_next
+        frame_str = " | ".join(frames) if frames else ""
+        if frame_str:
+            logger.error("%s %s: %s", message, exc_type, frame_str)
+        else:
+            logger.error("%s %s", message, exc_type)
+    except Exception:
+        logger.error("%s %s", message, exc_type)

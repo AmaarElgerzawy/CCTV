@@ -63,6 +63,8 @@ const recNextClip = document.getElementById("rec-next-clip");
 const recStop = document.getElementById("rec-stop");
 const recPlaybackStatus = document.getElementById("rec-playback-status");
 const recPlaybackFrame = document.getElementById("rec-playback-frame");
+const networkLoadBtn = document.getElementById("network-load");
+const encodeLoadBtn = document.getElementById("encode-load");
 
 const CALL_METADATA_KEYS = new Set(["succeeded_calls", "failed_calls"]);
 const MAX_TABLE_ROWS = 400;
@@ -1694,9 +1696,23 @@ function clearLargeView() {
 }
 
 async function openLarge(channel) {
+  if (deviceState.offline || deviceState.selectedId === null) {
+    setSectionNote(liveStatus, "error", "Device is offline");
+    return;
+  }
   if (!liveState.publicUrl) {
     setSectionNote(liveStatus, "error", "Live view is not configured.");
     return;
+  }
+
+  // Stop this channel's sub stream tile first so it replaces the sub stream
+  const tile = liveState.tiles.get(channel);
+  if (tile && tile.name && tile.quality !== "main") {
+    try {
+      await stopTile(channel);
+    } catch {
+      // ignore
+    }
   }
 
   setSectionNote(
@@ -1837,8 +1853,7 @@ async function loadAll() {
   await loadChannels();
   await loadRecordingsTime();
   await loadStorageHealth();
-  await loadConfig("Network", networkStatus, networkTable, networkRaw);
-  await loadConfig("Encode", encodeStatus, encodeTable, encodeRaw);
+  // Network/Encode load only on demand (button/open)
   setLoading(false);
 }
 
@@ -2127,6 +2142,16 @@ recNextClip.addEventListener("click", () => goToAdjacentClip("next"));
 recStop.addEventListener("click", () => {
   stopPlayback();
 });
+if (networkLoadBtn) {
+  networkLoadBtn.addEventListener("click", () => {
+    loadConfig("Network", networkStatus, networkTable, networkRaw);
+  });
+}
+if (encodeLoadBtn) {
+  encodeLoadBtn.addEventListener("click", () => {
+    loadConfig("Encode", encodeStatus, encodeTable, encodeRaw);
+  });
+}
 if (dashboardDeviceSelect) {
   dashboardDeviceSelect.addEventListener("change", async () => {
     const newId = Number(dashboardDeviceSelect.value);
