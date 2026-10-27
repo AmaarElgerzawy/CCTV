@@ -7,6 +7,13 @@ const rawOutput = document.getElementById("raw");
 const updatedLabel = document.getElementById("updated");
 const failedNote = document.getElementById("failed-calls");
 
+const dashboardDeviceName = document.getElementById("dashboard-device-name");
+const dashboardDeviceGroup = document.getElementById("dashboard-device-group");
+const dashboardDeviceState = document.getElementById("dashboard-device-state");
+const dashboardDeviceSelect = document.getElementById("dashboard-device-select");
+const dashboardDeviceOffline = document.getElementById("dashboard-device-offline");
+const dashboardDevicePicker = document.getElementById("dashboard-device-picker");
+
 const summaryFields = {
   device_type: document.getElementById("device-type"),
   device_class: document.getElementById("device-class"),
@@ -63,10 +70,13 @@ const LIVE_FALLBACK_CHANNELS = 4;
 const LIVE_RENEW_INTERVAL_MS = 10000;
 const LIVE_START_GAP_MS = 400;
 const LIVE_INCLUDE_KEY_PREFIX = "dvr-live-include-";
-const DEFAULT_MAX_CHANNEL = 8;
+const LIVE_INCLUDE_KEY_PREFIX_DEVICE = "dvr-live-include-dev-";
+const PAGE_KEY = "dashboard";
+const APP_VERSION = "0.7.0";
 const DAY_SECONDS = 86400;
 const MAX_RECORDING_ROWS = 400;
 const PLAYBACK_SECONDS = 600;
+const DEFAULT_MAX_CHANNEL = 8;
 
 const liveState = {
   publicUrl: null,
@@ -94,6 +104,36 @@ const playbackState = {
   selectedSeconds: null,
   busy: false,
 };
+
+const deviceState = {
+  selectedId: null,
+  devices: [],
+  statusMap: new Map(),
+  offline: false,
+  loaded: false,
+};
+
+function getDeviceIdQuery() {
+  if (deviceState.selectedId === null || deviceState.selectedId === undefined) {
+    return "";
+  }
+  const id = Number(deviceState.selectedId);
+  if (!Number.isInteger(id) || id <= 0) {
+    return "";
+  }
+  return `device_id=${encodeURIComponent(id)}`;
+}
+
+function addDeviceParam(url) {
+  const q = getDeviceIdQuery();
+  if (!q) {
+    return url;
+  }
+  if (url.includes("?")) {
+    return `${url}&${q}`;
+  }
+  return `${url}?${q}`;
+}
 
 function formatValue(value) {
   if (value === null || value === undefined) {
@@ -456,7 +496,7 @@ async function loadDeviceInfo() {
   setStatus("loading", "Loading device information…");
 
   try {
-    const payload = await fetchJson("/api/device/info");
+    const payload = await fetchJson(addDeviceParam("/api/device/info"));
     const info = payload?.info;
     if (!info || typeof info !== "object" || Array.isArray(info)) {
       throw new Error("The server did not return device information.");
@@ -486,7 +526,7 @@ async function loadChannels() {
   setSectionNote(channelsStatus, "loading", "Loading channels…");
 
   try {
-    const payload = await fetchJson("/api/channels");
+    const payload = await fetchJson(addDeviceParam("/api/channels"));
     const channels = payload?.channels;
     if (!channels || typeof channels !== "object" || Array.isArray(channels)) {
       throw new Error("The server did not return channel information.");
@@ -508,10 +548,16 @@ async function loadChannels() {
 }
 
 async function loadConfig(name, statusElement, tableElement, rawElement) {
+  if (deviceState.offline || deviceState.selectedId === null) {
+    setSectionNote(statusElement, "warn", "Device not available.");
+    tableElement.replaceChildren();
+    rawElement.textContent = "—";
+    return;
+  }
   setSectionNote(statusElement, "loading", `Loading ${name}…`);
 
   try {
-    const payload = await fetchJson(`/api/config/${encodeURIComponent(name)}`);
+    const payload = await fetchJson(addDeviceParam(`/api/config/${encodeURIComponent(name)}`));
     const config = payload?.config;
     if (!config || typeof config !== "object" || Array.isArray(config)) {
       throw new Error(`The server did not return ${name} configuration.`);
@@ -832,6 +878,10 @@ function renderRecordings(payload, channel, date, stream) {
 }
 
 async function loadRecordings() {
+  if (deviceState.offline || deviceState.selectedId === null) {
+    setSectionNote(recStatus, "error", "Device is offline");
+    return;
+  }
   if (recordingsState.loading) {
     return;
   }
@@ -869,6 +919,7 @@ async function loadRecordings() {
       date,
       stream,
     });
+    params.append("device_id", String(deviceState.selectedId));
     const payload = await fetchJson(`/api/recordings?${params.toString()}`);
     if (requestId === recordingsState.requestId) {
       renderRecordings(payload, channel, date, stream);
@@ -892,11 +943,14 @@ async function loadRecordings() {
 }
 
 async function loadRecordingsTime() {
+  if (deviceState.offline || deviceState.selectedId === null) {
+    return;
+  }
   if (recDate.value) {
     return;
   }
   try {
-    const payload = await fetchJson("/api/recordings/time");
+    const payload = await fetchJson(addDeviceParam("/api/recordings/time"));
     const value =
       typeof payload?.device_time === "string"
         ? payload.device_time.slice(0, 10)
@@ -932,11 +986,17 @@ async function loadRecordingsTime() {
 }
 
 async function loadStorageHealth() {
+  if (deviceState.offline || deviceState.selectedId === null) {
+    recHealth.className = "badge";
+    recHealth.textContent = "Storage unknown";
+    recHealth.title = "Device offline.";
+    return;
+  }
   recHealth.className = "badge";
   recHealth.textContent = "Storage…";
   recHealth.title = "Reading storage health.";
   try {
-    const payload = await fetchJson("/api/storage");
+    const payload = await fetchJson(addDeviceParam("/api/storage"));
     const disks = Number.isInteger(payload?.disks)
       ? payload.disks
       : 0;
@@ -1071,13 +1131,14 @@ async function startPlayback(startSeconds) {
   }
 
   try {
-    const payload = await fetchJson("/api/playback/open", {
+    const payload = await fetchJson(addDeviceParam("/api/playback/open"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         channel,
         start: `${date} ${formatDaySeconds(startSeconds)}`,
         seconds: PLAYBACK_SECONDS,
+        device_id: deviceState.selectedId,
       }),
     });
     const name = payload?.stream_name;
@@ -1187,9 +1248,9 @@ function createLiveTiles(count) {
 
     const include = document.createElement("input");
     include.type = "checkbox";
-    include.checked = readInclude(channel);
+    include.checked = readLiveIncludeForDevice(channel);
     include.addEventListener("change", () =>
-      writeInclude(channel, include.checked),
+      writeLiveIncludeForDevice(channel, include.checked),
     );
     includeLabel.append(include, document.createTextNode("Include"));
 
@@ -1331,17 +1392,29 @@ function buildLiveFrame(name, title) {
 }
 
 function sendCloseBeacon(name) {
-  const url = `/api/live/${encodeURIComponent(name)}/close`;
+  const url = addDeviceParam(`/api/live/${encodeURIComponent(name)}/close`);
   if (navigator.sendBeacon) {
-    navigator.sendBeacon(url);
+    try {
+      const data = new Blob([JSON.stringify({ device_id: deviceState.selectedId })], { type: "application/json" });
+      navigator.sendBeacon(url, data);
+    } catch {
+      navigator.sendBeacon(url);
+    }
     return;
   }
-  fetch(url, { method: "POST", keepalive: true }).catch(() => {});
+  fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device_id: deviceState.selectedId }),
+    keepalive: true,
+  }).catch(() => {});
 }
 
 async function closeStream(name) {
-  await fetchJson(`/api/live/${encodeURIComponent(name)}/close`, {
+  await fetchJson(addDeviceParam(`/api/live/${encodeURIComponent(name)}/close`), {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device_id: deviceState.selectedId }),
   });
 }
 
@@ -1361,8 +1434,12 @@ async function startTile(channel, quality = "sub", gap = false) {
 
   try {
     const payload = await fetchJson(
-      `/api/live/${channel}/open?quality=${selected}`,
-      { method: "POST" },
+      addDeviceParam(`/api/live/${channel}/open?quality=${selected}`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: deviceState.selectedId }),
+      },
     );
     const name = payload?.stream_name;
     if (typeof name !== "string" || name === "") {
@@ -1644,8 +1721,12 @@ async function openLarge(channel) {
 
   try {
     const payload = await fetchJson(
-      `/api/live/${channel}/open?quality=main`,
-      { method: "POST" },
+      addDeviceParam(`/api/live/${channel}/open?quality=main`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: deviceState.selectedId }),
+      },
     );
     const name = payload?.stream_name;
     if (typeof name !== "string" || name === "") {
@@ -1704,10 +1785,15 @@ function closeAllOnUnload() {
 }
 
 async function loadLiveConfig() {
+  if (deviceState.offline || deviceState.selectedId === null) {
+    liveState.publicUrl = null;
+    setSectionNote(liveStatus, "warn", "Device not available.");
+    return;
+  }
   setSectionNote(liveStatus, "loading", "Loading live-view configuration…");
 
   try {
-    const payload = await fetchJson("/api/config");
+    const payload = await fetchJson(addDeviceParam("/api/config"));
     const url = payload?.public_go2rtc_url;
     if (typeof url !== "string" || !/^https?:\/\//.test(url)) {
       throw new Error("The server did not return a usable go2rtc URL.");
@@ -1739,6 +1825,10 @@ async function loadLiveConfig() {
 }
 
 async function loadAll() {
+  if (deviceState.selectedId === null) {
+    setLoading(false);
+    return;
+  }
   setLoading(true);
   // Sequential requests: one short-lived DVR session at a time, so a DVR that
   // limits concurrent sessions is not asked to hold four logins at once.
@@ -1750,6 +1840,275 @@ async function loadAll() {
   await loadConfig("Network", networkStatus, networkTable, networkRaw);
   await loadConfig("Encode", encodeStatus, encodeTable, encodeRaw);
   setLoading(false);
+}
+
+function readStoredDevice() {
+  try {
+    return localStorage.getItem("dvr-last-device-dashboard") || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredDevice(id) {
+  try {
+    localStorage.setItem("dvr-last-device-dashboard", String(id));
+  } catch {
+    // Ignore storage failures
+  }
+}
+
+function getDeviceIdFromUrl() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const val = params.get("device");
+    if (!val) {
+      return null;
+    }
+    const num = Number(val);
+    if (!Number.isInteger(num) || num <= 0) {
+      return null;
+    }
+    return num;
+  } catch {
+    return null;
+  }
+}
+
+function readLiveIncludeForDevice(channel) {
+  if (deviceState.selectedId !== null && deviceState.selectedId !== undefined) {
+    try {
+      const key = `${LIVE_INCLUDE_KEY_PREFIX_DEVICE}${deviceState.selectedId}-${channel}`;
+      const stored = localStorage.getItem(key);
+      if (stored !== null) {
+        return stored === "1";
+      }
+    } catch {
+      // fall through
+    }
+  }
+  return readInclude(channel);
+}
+
+function writeLiveIncludeForDevice(channel, included) {
+  if (deviceState.selectedId !== null && deviceState.selectedId !== undefined) {
+    try {
+      const key = `${LIVE_INCLUDE_KEY_PREFIX_DEVICE}${deviceState.selectedId}-${channel}`;
+      localStorage.setItem(key, included ? "1" : "0");
+      return;
+    } catch {
+      // fall through
+    }
+  }
+  writeInclude(channel, included);
+}
+
+function deviceIdQuerySuffix() {
+  if (deviceState.selectedId === null || deviceState.selectedId === undefined) {
+    return "";
+  }
+  const id = Number(deviceState.selectedId);
+  if (!Number.isInteger(id) || id <= 0) {
+    return "";
+  }
+  return `device_id=${encodeURIComponent(id)}`;
+}
+
+function addDeviceParam(url) {
+  const suffix = deviceIdQuerySuffix();
+  if (!suffix) {
+    return url;
+  }
+  if (url.includes("?")) {
+    return `${url}&${suffix}`;
+  }
+  return `${url}?${suffix}`;
+}
+
+function postJsonWithDevice(url, body) {
+  return fetchJson(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...body, device_id: deviceState.selectedId }),
+  });
+}
+
+async function stopAllStreamsForCurrentDevice() {
+  // Stop all known streams
+  const names = [...playingNames()];
+  for (const name of names) {
+    try {
+      await closeStream(name);
+    } catch {
+      // ignore
+    }
+  }
+  if (playbackState.name) {
+    try {
+      await closeStream(playbackState.name);
+    } catch {
+      // ignore
+    }
+  }
+  // Safety net: call close-all for device
+  if (deviceState.selectedId !== null && deviceState.selectedId !== undefined) {
+    try {
+      await fetchJson(`/api/devices/${encodeURIComponent(deviceState.selectedId)}/streams/close-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+    } catch {
+      // ignore
+    }
+  }
+  // Clear local state
+  for (const [channel, tile] of liveState.tiles) {
+    tile.name = null;
+    tile.quality = null;
+    tile.frame.replaceChildren(emptyNode("Not started."));
+    tile.badge.textContent = "Idle";
+    tile.badge.className = "live-badge";
+  }
+  if (liveState.large) {
+    clearLargeView();
+  }
+  playbackState.name = null;
+  playbackState.startSeconds = null;
+  playbackState.selectedSeconds = null;
+  playbackState.busy = false;
+  stopRenewTimer();
+  updateLiveButtons();
+}
+
+function updateDeviceHeader() {
+  if (!dashboardDeviceName || !dashboardDeviceGroup || !dashboardDeviceState) {
+    return;
+  }
+  const dev = deviceState.devices.find((d) => Number(d.id) === Number(deviceState.selectedId));
+  if (dev) {
+    dashboardDeviceName.textContent = dev.name || `Device ${dev.id}`;
+    dashboardDeviceGroup.textContent = dev.group || "—";
+    const st = deviceState.statusMap.get(Number(dev.id)) || dev.state || "unknown";
+    dashboardDeviceState.textContent = st;
+    dashboardDeviceState.className = st === "online" ? "badge ok" : st === "offline" ? "badge warn" : "badge";
+  } else if (deviceState.selectedId !== null) {
+    dashboardDeviceName.textContent = `Device ${deviceState.selectedId}`;
+    dashboardDeviceGroup.textContent = "—";
+    const st = deviceState.statusMap.get(Number(deviceState.selectedId)) || "unknown";
+    dashboardDeviceState.textContent = st;
+    dashboardDeviceState.className = st === "online" ? "badge ok" : st === "offline" ? "badge warn" : "badge";
+  } else {
+    dashboardDeviceName.textContent = "—";
+    dashboardDeviceGroup.textContent = "—";
+    dashboardDeviceState.textContent = "—";
+    dashboardDeviceState.className = "badge";
+  }
+  if (dashboardDeviceOffline) {
+    if (deviceState.offline && deviceState.selectedId !== null) {
+      dashboardDeviceOffline.hidden = false;
+    } else {
+      dashboardDeviceOffline.hidden = true;
+    }
+  }
+  if (dashboardDevicePicker) {
+    if (deviceState.selectedId === null) {
+      dashboardDevicePicker.hidden = false;
+    } else {
+      dashboardDevicePicker.hidden = true;
+    }
+  }
+}
+
+function setDashboardControlsEnabled(enabled) {
+  // Enable/disable live and recordings controls
+  if (liveConnect) liveConnect.disabled = !enabled || !liveState.publicUrl;
+  if (liveDisconnect) liveDisconnect.disabled = !enabled;
+  if (liveQuality) liveQuality.disabled = !enabled;
+  if (recLoad) recLoad.disabled = !enabled;
+  if (recChannel) recChannel.disabled = !enabled;
+  if (recDate) recDate.disabled = !enabled;
+  if (recStream) recStream.disabled = !enabled;
+}
+
+async function loadDevicesList() {
+  try {
+    const payload = await fetchJson("/api/devices");
+    deviceState.devices = Array.isArray(payload?.devices) ? payload.devices : [];
+  } catch {
+    deviceState.devices = [];
+  }
+  // Build selector
+  if (dashboardDeviceSelect) {
+    dashboardDeviceSelect.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    for (const dev of deviceState.devices) {
+      const opt = document.createElement("option");
+      opt.value = String(dev.id);
+      const group = dev.group ? `[${dev.group}] ` : "";
+      opt.textContent = `${group}${dev.name || dev.host || dev.id}`;
+      frag.append(opt);
+    }
+    dashboardDeviceSelect.append(frag);
+    if (deviceState.selectedId !== null) {
+      dashboardDeviceSelect.value = String(deviceState.selectedId);
+    }
+  }
+  // Load status
+  try {
+    const st = await fetchJson("/api/status");
+    const list = Array.isArray(st?.devices) ? st.devices : [];
+    deviceState.statusMap.clear();
+    for (const d of list) {
+      if (d && d.id !== undefined) {
+        deviceState.statusMap.set(Number(d.id), d.state || "unknown");
+      }
+    }
+  } catch {
+    // ignore
+  }
+  updateDeviceHeader();
+  const stSel = deviceState.statusMap.get(Number(deviceState.selectedId));
+  deviceState.offline = stSel === "offline";
+  setDashboardControlsEnabled(!deviceState.offline && deviceState.selectedId !== null);
+  updateDeviceHeader();
+}
+
+async function initDeviceSelection() {
+  const fromUrl = getDeviceIdFromUrl();
+  const fromStore = readStoredDevice();
+  let chosen = fromUrl !== null ? fromUrl : (fromStore !== null ? Number(fromStore) : null);
+  await loadDevicesList();
+  if (chosen === null || Number.isNaN(chosen)) {
+    // No device selected
+    deviceState.selectedId = null;
+    updateDeviceHeader();
+    setDashboardControlsEnabled(false);
+    // Show picker
+    if (dashboardDevicePicker) dashboardDevicePicker.hidden = false;
+    if (dashboardDeviceOffline) dashboardDeviceOffline.hidden = true;
+    return;
+  }
+  // Check if exists
+  const exists = deviceState.devices.some((d) => Number(d.id) === Number(chosen));
+  if (!exists && deviceState.devices.length > 0) {
+    // Try first? but requirement says show picker if none valid; just pick first if exists? follow requirement: if no device in URL and none remembered -> picker. If remembered but invalid, maybe still try to use it? But safer to use it if backend can resolve; but UI should follow. We'll use chosen if present in list else picker.
+    // But easier: if not in list, maybe still allow if devices exist? The requirement says "If there is no device in the URL and none remembered in localStorage, show a picker that links to /devices and load nothing." It doesn't say clear invalid remembered; but better to respect chosen if it came from URL or store and exists? We'll set if exists else null.
+  }
+  if (!exists) {
+    deviceState.selectedId = null;
+    updateDeviceHeader();
+    setDashboardControlsEnabled(false);
+    if (dashboardDevicePicker) dashboardDevicePicker.hidden = false;
+    return;
+  }
+  deviceState.selectedId = chosen;
+  writeStoredDevice(chosen);
+  if (dashboardDeviceSelect) dashboardDeviceSelect.value = String(chosen);
+  const stSel = deviceState.statusMap.get(Number(chosen));
+  deviceState.offline = stSel === "offline";
+  setDashboardControlsEnabled(!deviceState.offline);
+  updateDeviceHeader();
 }
 
 refreshButton.addEventListener("click", loadAll);
@@ -1768,8 +2127,54 @@ recNextClip.addEventListener("click", () => goToAdjacentClip("next"));
 recStop.addEventListener("click", () => {
   stopPlayback();
 });
+if (dashboardDeviceSelect) {
+  dashboardDeviceSelect.addEventListener("change", async () => {
+    const newId = Number(dashboardDeviceSelect.value);
+    if (!Number.isInteger(newId) || newId <= 0) {
+      return;
+    }
+    if (Number(newId) === Number(deviceState.selectedId)) {
+      return;
+    }
+    // Stop previous device streams
+    await stopAllStreamsForCurrentDevice();
+    // Clear recordings and timeline
+    clearRecordings();
+    // Update selection
+    deviceState.selectedId = newId;
+    writeStoredDevice(newId);
+    // Update status
+    await loadDevicesList();
+    const stSel = deviceState.statusMap.get(Number(newId));
+    deviceState.offline = stSel === "offline";
+    setDashboardControlsEnabled(!deviceState.offline);
+    updateDeviceHeader();
+    // Reload only info+channels
+    if (!deviceState.offline) {
+      await loadDeviceInfo();
+      await loadChannels();
+    } else {
+      // Keep refresh available, disable live/recordings
+      setStatus("warn", "Device is offline");
+    }
+  });
+}
 window.addEventListener("pagehide", closeAllOnUnload);
 syncRecordingChannels(null);
 updateLiveButtons();
 updatePlaybackButtons();
-loadAll();
+// Initialize device selection then load
+initDeviceSelection().then(() => {
+  if (deviceState.selectedId === null) {
+    setStatus("warn", "No device selected");
+    setLoading(false);
+    return;
+  }
+  if (deviceState.offline) {
+    setStatus("warn", "Device is offline");
+    setLoading(false);
+    // Still allow refresh? requirement says keep Refresh
+    return;
+  }
+  loadAll();
+});

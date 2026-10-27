@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DVR Dashboard</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=0.7.0">
 </head>
 <body>
   <main class="page">
@@ -16,6 +16,30 @@
           Read-only device identity, video input channels, and selected
           configuration from the recorder.
         </p>
+        <div class="device-header">
+          <div class="device-header-info">
+            <div class="device-header-row">
+              <span class="device-header-label">Device</span>
+              <span id="dashboard-device-name" class="device-header-value">—</span>
+            </div>
+            <div class="device-header-row">
+              <span class="device-header-label">Group</span>
+              <span id="dashboard-device-group" class="device-header-value">—</span>
+            </div>
+            <div class="device-header-row">
+              <span class="device-header-label">State</span>
+              <span id="dashboard-device-state" class="badge">—</span>
+            </div>
+          </div>
+          <label class="device-header-select" for="dashboard-device-select">
+            Select device
+            <select id="dashboard-device-select"></select>
+          </label>
+          <p id="dashboard-device-offline" class="section-note error" hidden>Device is offline</p>
+          <p id="dashboard-device-picker" class="section-note warn" hidden>
+            No device selected. <a href="/devices">Choose a device</a>.
+          </p>
+        </div>
       </div>
       <div class="topbar-actions">
         <a class="button button-ghost" href="/devices">Devices</a>
@@ -286,7 +310,8 @@
     </footer>
   </main>
 
-  <script src="/static/playback_clips.js" defer></script>
-  <script src="/static/app.js" defer></script>
+  <script src="/static/playback_clips.js?v=0.7.0" defer></script>
+  <script src="/static/device_selector.js?v=0.7.0" defer></script>
+  <script src="/static/app.js?v=0.7.0" defer></script>
 </body>
 </html>

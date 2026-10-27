@@ -205,6 +205,10 @@ function deviceRow(device, info) {
 
   const actions = document.createElement("div");
   actions.className = "device-actions";
+  const openButton = document.createElement("a");
+  openButton.className = "button button-ghost button-small";
+  openButton.textContent = "Open";
+  openButton.href = `/?device=${encodeURIComponent(device.id)}`;
   const testButton = document.createElement("button");
   testButton.type = "button";
   testButton.className = "button button-ghost button-small";
@@ -229,7 +233,7 @@ function deviceRow(device, info) {
   deleteButton.addEventListener("click", () => {
     removeDevice(device);
   });
-  actions.append(testButton, editButton, deleteButton);
+  actions.append(openButton, testButton, editButton, deleteButton);
 
   row.append(dot, main, flags, actions);
   const wrapper = document.createElement("div");
