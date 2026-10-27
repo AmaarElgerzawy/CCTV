@@ -16,7 +16,7 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
@@ -33,12 +33,14 @@ DEFAULT_MAX_CHANNEL = 8
 DEFAULT_MAX_LIVE_STREAMS = 6
 DEFAULT_MAX_MAIN_STREAMS = 2
 DEFAULT_MAX_PLAYBACK_STREAMS = 2
+DEFAULT_MAX_STREAMS_PER_DEVICE = 4
+DEFAULT_MAX_MAIN_PER_DEVICE = 1
+DEFAULT_RTSP_PORT = 554
 DEFAULT_PLAYBACK_MAX_SECONDS = 3600
 DEFAULT_PLAYBACK_SECONDS = 600
 PLAYBACK_MIN_SECONDS = 30
 DEFAULT_LEASE_TIMEOUT_SECONDS = 30.0
 DEFAULT_LEASE_CHECK_INTERVAL_SECONDS = 5.0
-_RTSP_PORT = 554
 _PLAYBACK_TIME_FORMAT = "%Y_%m_%d_%H_%M_%S"
 _STREAM_NAME = re.compile(r"^cctv-[A-Za-z0-9_-]{8,64}$")
 
@@ -55,8 +57,24 @@ class StreamLimitError(StreamError):
     """A configured stream limit would be exceeded."""
 
 
+@dataclass(frozen=True)
+class StreamDevice:
+    """Request-scoped DVR connection data for one stream registration.
+
+    The password is excluded from ``repr`` and must not be stored on the
+    manager or in an ``ActiveStream``.
+    """
+
+    device_id: int
+    host: str
+    rtsp_port: int = DEFAULT_RTSP_PORT
+    username: str = ""
+    password: str = field(default="", repr=False)
+
+
 @dataclass
 class ActiveStream:
+    device_id: int
     channel: int
     quality: str
     last_renewed: float
@@ -149,14 +167,13 @@ class StreamManager:
         self,
         *,
         go2rtc_url: str,
-        dvr_host: str,
-        dvr_user: str,
-        dvr_pass: str,
         transcode_h264: bool = True,
         max_channel: int = DEFAULT_MAX_CHANNEL,
         max_live_streams: int = DEFAULT_MAX_LIVE_STREAMS,
         max_main_streams: int = DEFAULT_MAX_MAIN_STREAMS,
         max_playback_streams: int = DEFAULT_MAX_PLAYBACK_STREAMS,
+        max_streams_per_device: int = DEFAULT_MAX_STREAMS_PER_DEVICE,
+        max_main_per_device: int = DEFAULT_MAX_MAIN_PER_DEVICE,
         playback_max_seconds: int = DEFAULT_PLAYBACK_MAX_SECONDS,
         lease_timeout: float = DEFAULT_LEASE_TIMEOUT_SECONDS,
         lease_check_interval: float = DEFAULT_LEASE_CHECK_INTERVAL_SECONDS,
@@ -172,20 +189,23 @@ class StreamManager:
             raise StreamConfigError(
                 "MAX_PLAYBACK_STREAMS must be a positive integer"
             )
+        if max_streams_per_device < 1 or max_main_per_device < 1:
+            raise StreamConfigError(
+                "Per-device stream limits must be positive integers"
+            )
         if playback_max_seconds < PLAYBACK_MIN_SECONDS:
             raise StreamConfigError(
                 f"PLAYBACK_MAX_SECONDS must be at least {PLAYBACK_MIN_SECONDS}"
             )
         if lease_timeout <= 0 or lease_check_interval <= 0:
             raise StreamConfigError("Lease settings must be positive numbers")
-        self._dvr_host = _dvr_hostname(dvr_host)
-        self._dvr_user = dvr_user
-        self._dvr_pass = dvr_pass
         self._transcode_h264 = transcode_h264
         self._max_channel = max_channel
         self._max_live_streams = max_live_streams
         self._max_main_streams = max_main_streams
         self._max_playback_streams = max_playback_streams
+        self._max_streams_per_device = max_streams_per_device
+        self._max_main_per_device = max_main_per_device
         self._playback_max_seconds = playback_max_seconds
         self._lease_timeout = lease_timeout
         self._lease_check_interval = lease_check_interval
@@ -204,23 +224,12 @@ class StreamManager:
     def from_env(cls, **kwargs: Any) -> "StreamManager":
         """Build a manager from .env / process environment.
 
-        Errors name missing variables only; values are never included.
+        DVR connection data now comes from the registry per request, so no
+        DVR_* variable is required here.
         """
         load_dotenv()
-        missing = [
-            name
-            for name in ("DVR_HOST", "DVR_USER", "DVR_PASS")
-            if not os.environ.get(name)
-        ]
-        if missing:
-            raise StreamConfigError(
-                "Missing environment variable(s): " + ", ".join(missing)
-            )
         return cls(
             go2rtc_url=_env_url("GO2RTC_URL", DEFAULT_GO2RTC_URL),
-            dvr_host=os.environ["DVR_HOST"],
-            dvr_user=os.environ["DVR_USER"],
-            dvr_pass=os.environ["DVR_PASS"],
             transcode_h264=_env_bool("STREAM_TRANSCODE_H264", True),
             max_channel=_env_positive_int("MAX_CHANNEL", DEFAULT_MAX_CHANNEL),
             max_live_streams=_env_positive_int(
@@ -231,6 +240,12 @@ class StreamManager:
             ),
             max_playback_streams=_env_positive_int(
                 "MAX_PLAYBACK_STREAMS", DEFAULT_MAX_PLAYBACK_STREAMS
+            ),
+            max_streams_per_device=_env_positive_int(
+                "MAX_STREAMS_PER_DEVICE", DEFAULT_MAX_STREAMS_PER_DEVICE
+            ),
+            max_main_per_device=_env_positive_int(
+                "MAX_MAIN_PER_DEVICE", DEFAULT_MAX_MAIN_PER_DEVICE
             ),
             playback_max_seconds=_env_positive_int(
                 "PLAYBACK_MAX_SECONDS", DEFAULT_PLAYBACK_MAX_SECONDS
@@ -282,11 +297,22 @@ class StreamManager:
                 if stream.kind == "playback"
             )
 
-    def open(self, channel: int, quality: str = "sub") -> str:
+    def active_device_count(self, device_id: int) -> int:
+        """Return the number of live and playback streams for one device."""
+        with self._lock:
+            return sum(
+                1
+                for stream in self._active.values()
+                if stream.device_id == device_id
+            )
+
+    def open(
+        self, device: StreamDevice, channel: int, quality: str = "sub"
+    ) -> str:
         """Register one stream and return its opaque go2rtc name.
 
         The limit check and the registry reservation happen under one lock, so
-        concurrent requests cannot exceed a configured limit.
+        concurrent requests cannot exceed a global or per-device limit.
         """
         if quality not in {"sub", "main"}:
             raise StreamConfigError("quality must be sub or main")
@@ -317,7 +343,9 @@ class StreamManager:
                     f"Main-stream limit reached ({self._max_main_streams}). "
                     "Stop another main stream or switch Grid quality to Sub."
                 )
+            self._check_device_limits(device.device_id, quality)
             self._active[name] = ActiveStream(
+                device_id=device.device_id,
                 channel=channel,
                 quality=quality,
                 last_renewed=self._clock(),
@@ -325,7 +353,7 @@ class StreamManager:
             self._created.add(name)
 
         try:
-            self._register(name, self._build_source(channel, quality))
+            self._register(name, self._build_source(device, channel, quality))
         except Exception:
             with self._lock:
                 self._active.pop(name, None)
@@ -334,7 +362,11 @@ class StreamManager:
         return name
 
     def open_playback(
-        self, channel: int, start: datetime, seconds: int
+        self,
+        device: StreamDevice,
+        channel: int,
+        start: datetime,
+        seconds: int,
     ) -> str:
         """Register one recorded-playback stream and return its name.
 
@@ -364,7 +396,9 @@ class StreamManager:
                     f"({self._max_playback_streams}). "
                     "Stop a playback and try again."
                 )
+            self._check_device_limits(device.device_id, "main")
             self._active[name] = ActiveStream(
+                device_id=device.device_id,
                 channel=channel,
                 quality="main",
                 last_renewed=self._clock(),
@@ -374,7 +408,8 @@ class StreamManager:
 
         try:
             self._register(
-                name, self._build_playback_source(channel, start, seconds)
+                name,
+                self._build_playback_source(device, channel, start, seconds),
             )
         except Exception:
             with self._lock:
@@ -382,6 +417,61 @@ class StreamManager:
                 self._created.discard(name)
             raise
         return name
+
+    def _check_device_limits(self, device_id: int, quality: str) -> None:
+        """Raise a safe per-device limit error. Caller holds the lock."""
+        device_count = sum(
+            1
+            for stream in self._active.values()
+            if stream.device_id == device_id
+        )
+        if device_count >= self._max_streams_per_device:
+            raise StreamLimitError(
+                "Device stream limit reached "
+                f"({self._max_streams_per_device} live and playback "
+                "streams). Stop a stream on this device and try again."
+            )
+        if quality != "main":
+            return
+        main_count = sum(
+            1
+            for stream in self._active.values()
+            if stream.device_id == device_id
+            and (
+                stream.kind == "playback"
+                or (stream.kind == "live" and stream.quality == "main")
+            )
+        )
+        if main_count >= self._max_main_per_device:
+            raise StreamLimitError(
+                "Device main-stream limit reached "
+                f"({self._max_main_per_device}). Stop a main stream or "
+                "playback on this device and try again."
+            )
+
+    def close_all_for_device(self, device_id: int) -> int:
+        """Delete every live and playback stream registered by one device.
+
+        Names are reserved under the lock before any network call, so the
+        device's slots are free even if a go2rtc delete fails.
+        """
+        with self._lock:
+            names = [
+                name
+                for name, stream in self._active.items()
+                if stream.device_id == device_id
+            ]
+            for name in names:
+                self._active.pop(name, None)
+        for name in names:
+            try:
+                self._delete(name)
+            except StreamError:
+                logger.warning("go2rtc could not delete a device stream")
+                continue
+            with self._lock:
+                self._created.discard(name)
+        return len(names)
 
     def close_stream(self, name: str) -> None:
         """Delete one stream as soon as it is closed.
@@ -516,12 +606,15 @@ class StreamManager:
             self._created.clear()
         self._client.close()
 
-    def _build_source(self, channel: int, quality: str) -> str:
+    def _build_source(
+        self, device: StreamDevice, channel: int, quality: str
+    ) -> str:
         subtype = 0 if quality == "main" else 1
-        user = quote(self._dvr_user, safe="")
-        password = quote(self._dvr_pass, safe="")
+        user = quote(device.username, safe="")
+        password = quote(device.password, safe="")
+        host = _dvr_hostname(device.host)
         rtsp_url = (
-            f"rtsp://{user}:{password}@{self._dvr_host}:{_RTSP_PORT}"
+            f"rtsp://{user}:{password}@{host}:{device.rtsp_port}"
             f"/cam/realmonitor?channel={channel}&subtype={subtype}"
         )
         if self._transcode_h264:
@@ -529,20 +622,25 @@ class StreamManager:
         return rtsp_url
 
     def _build_playback_source(
-        self, channel: int, start: datetime, seconds: int
+        self,
+        device: StreamDevice,
+        channel: int,
+        start: datetime,
+        seconds: int,
     ) -> str:
         """Build the recorded-playback RTSP source, never logged or returned.
 
         Times use the DVR's own local clock, exactly like the recordings list,
         so no timezone conversion is applied.
         """
-        user = quote(self._dvr_user, safe="")
-        password = quote(self._dvr_pass, safe="")
+        user = quote(device.username, safe="")
+        password = quote(device.password, safe="")
+        host = _dvr_hostname(device.host)
         end = start + timedelta(seconds=seconds)
         start_text = start.strftime(_PLAYBACK_TIME_FORMAT)
         end_text = end.strftime(_PLAYBACK_TIME_FORMAT)
         rtsp_url = (
-            f"rtsp://{user}:{password}@{self._dvr_host}:{_RTSP_PORT}"
+            f"rtsp://{user}:{password}@{host}:{device.rtsp_port}"
             f"/cam/playback?channel={channel}"
             f"&starttime={start_text}&endtime={end_text}"
         )

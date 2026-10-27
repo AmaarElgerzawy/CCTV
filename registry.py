@@ -19,7 +19,7 @@ import os
 import re
 import sqlite3
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
@@ -266,6 +266,38 @@ def _device_public(row: sqlite3.Row) -> dict[str, Any]:
         ),
         "notes": row["notes"] or "",
     }
+
+
+def _url_host(host: str) -> str:
+    """Bracket an IPv6 literal for a URL. Registry hosts are IPv4 or names."""
+    return f"[{host}]" if ":" in host else host
+
+
+@dataclass(frozen=True)
+class ResolvedDevice:
+    """One registry device with request-scoped plaintext credentials.
+
+    The password is excluded from ``repr`` so an accidental log call cannot
+    print it. Callers must not store this object beyond the request that
+    resolved it.
+    """
+
+    id: int
+    name: str
+    group: str | None
+    host: str
+    http_port: int
+    rtsp_port: int
+    username: str
+    password: str = field(repr=False)
+
+    @property
+    def base_url(self) -> str:
+        """Build the DVR HTTP base URL without a trailing slash."""
+        if self.http_port == DEFAULT_HTTP_PORT:
+            return f"http://{_url_host(self.host)}"
+        return f"http://{_url_host(self.host)}:{self.http_port}"
+
 
 
 def parse_csv_rows(text: str) -> list[tuple[int, dict[str, str]]]:
@@ -604,6 +636,47 @@ class DeviceRegistry:
         with self._db() as conn:
             row = self._fetch_device(conn, device_id)
         return _device_public(row)
+
+    def resolve_device(self, device_id: int | None = None) -> ResolvedDevice:
+        """Resolve a registry device and its effective credentials.
+
+        A missing id is only accepted when exactly one device exists. Unknown
+        ids and empty registries are 404s; a device with no usable own or
+        default credentials is a 409. The plaintext password is returned only
+        to the caller and is never included in the public device dictionary.
+        """
+        with self._db() as conn:
+            if device_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT d.*, g.name AS group_name
+                    FROM devices d
+                    LEFT JOIN groups g ON g.id = d.group_id
+                    ORDER BY d.id
+                    """
+                ).fetchall()
+                if not rows:
+                    raise RegistryError("No devices are registered.", 404)
+                if len(rows) > 1:
+                    raise RegistryError("device_id is required", 400)
+                row = rows[0]
+            else:
+                row = self._fetch_device(conn, device_id)
+
+        username, password = self.effective_credentials(row)
+        if not username or not password:
+            raise RegistryError("No credentials configured.", 409)
+
+        return ResolvedDevice(
+            id=row["id"],
+            name=row["name"],
+            group=row["group_name"],
+            host=row["host"],
+            http_port=row["http_port"],
+            rtsp_port=row["rtsp_port"],
+            username=username,
+            password=password,
+        )
 
     def _device_row(self, device_id: int) -> sqlite3.Row:
         with self._db() as conn:

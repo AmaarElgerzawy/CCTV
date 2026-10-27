@@ -180,42 +180,7 @@ def clear_cache() -> None:
     with _CACHE_GUARD:
         _CACHE.clear()
 
-
-def _cache_get(
-    key: tuple[str, int, str, str], now: float
-) -> dict[str, Any] | None:
-    with _CACHE_GUARD:
-        entry = _CACHE.get(key)
-        if entry is None:
-            return None
-        expires, result = entry
-        if now >= expires:
-            _CACHE.pop(key, None)
-            return None
-        return result
-
-
-def _cache_put(
-    key: tuple[str, int, str, str],
-    result: dict[str, Any],
-    expires: float,
-) -> None:
-    with _CACHE_GUARD:
-        _CACHE[key] = (expires, result)
-
-
-_LOCKS: dict[str, asyncio.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
-
-
-def _device_lock(host: str) -> asyncio.Lock:
-    """Return the per-device finder lock shared by every client instance."""
-    with _LOCKS_GUARD:
-        lock = _LOCKS.get(host)
-        if lock is None:
-            lock = asyncio.Lock()
-            _LOCKS[host] = lock
-        return lock
 
 
 class DvrCgi:
@@ -227,6 +192,7 @@ class DvrCgi:
         user: str,
         password: str,
         *,
+        device_id: int | None = None,
         response_channel_offset: int = DEFAULT_RESPONSE_CHANNEL_OFFSET,
         cache_seconds: float = DEFAULT_CACHE_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -241,6 +207,7 @@ class DvrCgi:
             raise CgiConfigError("RECORDINGS_CACHE_SECONDS must be positive")
 
         self._host = _normalize_base_url(host)
+        self._device_id = device_id
         self._response_channel_offset = int(response_channel_offset)
         self._cache_seconds = float(cache_seconds)
         self._clock = clock
@@ -267,13 +234,6 @@ class DvrCgi:
             os.environ["DVR_HOST"],
             os.environ["DVR_USER"],
             os.environ["DVR_PASS"],
-            response_channel_offset=_env_int(
-                "RESPONSE_CHANNEL_OFFSET",
-                DEFAULT_RESPONSE_CHANNEL_OFFSET,
-            ),
-            cache_seconds=_env_nonnegative_float(
-                "RECORDINGS_CACHE_SECONDS", DEFAULT_CACHE_SECONDS
-            ),
             **kwargs,
         )
 
@@ -316,19 +276,29 @@ class DvrCgi:
         if stream not in _STREAMS:
             raise ValueError("stream must be main or sub")
         requested_day = date_cls.fromisoformat(day)
-        key = (self._host, channel, day, stream)
+        key = (
+            self._host,
+            self._device_id if self._device_id is not None else 0,
+            channel,
+            day,
+            stream,
+        )
 
         cached = _cache_get(key, self._clock())
         if cached is not None:
             return cached
 
-        async with _device_lock(self._host):
+        lock = _device_lock(self._http.base_url.host or self._host, self._http.base_url.port or 80)
+        async with lock:
             cached = _cache_get(key, self._clock())
             if cached is not None:
                 return cached
-            result = await self._find_files(
-                channel, requested_day, _STREAMS[stream]
-            )
+            try:
+                result = await self._find_files(
+                    channel, requested_day, _STREAMS[stream]
+                )
+            except Exception:
+                raise
             _cache_put(
                 key,
                 result,

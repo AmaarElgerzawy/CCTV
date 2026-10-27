@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import os
 import re
+import time
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import date as date_cls, datetime
 from pathlib import Path
@@ -35,6 +37,7 @@ from registry import (
     RegistryConfigError,
     RegistryError,
     RegistrySettings,
+    ResolvedDevice,
     StatusChecker,
     StatusRoundBusy,
 )
@@ -42,6 +45,7 @@ from stream_manager import (
     DEFAULT_PLAYBACK_SECONDS,
     PLAYBACK_MIN_SECONDS,
     StreamConfigError,
+    StreamDevice,
     StreamError,
     StreamLimitError,
     StreamManager,
@@ -54,6 +58,19 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
 logger = logging.getLogger(__name__)
+
+
+try:
+    _DEVICE_INFO_CACHE_SECONDS = float(os.environ.get("DEVICE_INFO_CACHE_SECONDS", "60") or 60)
+except (TypeError, ValueError):
+    _DEVICE_INFO_CACHE_SECONDS = 60.0
+if _DEVICE_INFO_CACHE_SECONDS < 0:
+    _DEVICE_INFO_CACHE_SECONDS = 60.0
+_DEVICE_INFO_CACHE: dict[tuple[int, str], tuple[float, dict[str, Any]]] = {}
+_DEVICE_INFO_CACHE_LOCK = asyncio.Lock()
+
+_RPC_LOCKS: dict[int, asyncio.Lock] = {}
+_RPC_LOCKS_GUARD = asyncio.Lock()
 
 
 async def _lease_reaper(manager: StreamManager) -> None:
@@ -149,24 +166,48 @@ app = FastAPI(title="DVR Web", version="0.7.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-@contextmanager
-def _open_dvr() -> Iterator[DvrClient]:
-    """Open one client, log in, and always log out and close it.
-
-    A logout failure is logged with its safe diagnostic and does not replace
-    the error or result from the body.
-    """
-    client = DvrClient.from_env()
+def _open_dvr(host: str, username: str, password: str) -> DvrClient:
+    """Open one client, log in, and always log out and close it."""
+    client = DvrClient(host, username, password)
     try:
         client.login()
-        yield client
-    finally:
+        return client
+    except Exception:
         try:
-            client.logout()
-        except DvrLogoutError as exc:
-            logger.warning("DVR logout failed: %s", exc)
-        finally:
             client.close()
+        except Exception:
+            pass
+        raise
+
+
+async def _read_device_resolved(
+    request: Request, reader: Callable[[DvrClient], dict[str, Any]]
+) -> JSONResponse:
+    try:
+        device_id = _device_id_from_query(request)
+        resolved = await _resolve_device(request, device_id)
+        lock = await _rpc_lock(resolved.id)
+        async with lock:
+            client = await asyncio.to_thread(
+                lambda: _open_dvr(resolved.base_url, resolved.username, resolved.password)
+            )
+            try:
+                result = await asyncio.to_thread(reader, client)
+                return JSONResponse(result)
+            finally:
+                try:
+                    client.logout()
+                except DvrLogoutError as exc:
+                    logger.warning("DVR logout failed: %s", type(exc).__name__)
+                finally:
+                    client.close()
+    except RegistryError as exc:
+        return _registry_error(exc)
+    except DvrError as exc:
+        return _dvr_error(exc)
+    except Exception as exc:
+        logger.error("Unexpected error while reading DVR data: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
 
 
 def _dvr_error(exc: DvrError) -> JSONResponse:
@@ -225,8 +266,60 @@ async def _device_clock(client: DvrCgi) -> tuple[str, str]:
     except CgiConfigError:
         raise
     except CgiError as exc:
-        logger.warning("DVR clock unavailable: %s", exc)
+        logger.warning("DVR clock unavailable: %s", type(exc).__name__)
         return _server_clock(), "server"
+
+
+def _clear_device_caches(device_id: int | None = None) -> None:
+    if device_id is None:
+        _DEVICE_INFO_CACHE.clear()
+        return
+    keys = [k for k in _DEVICE_INFO_CACHE if k[0] == device_id]
+    for k in keys:
+        _DEVICE_INFO_CACHE.pop(k, None)
+
+
+async def _rpc_lock(device_id: int) -> asyncio.Lock:
+    async with _RPC_LOCKS_GUARD:
+        lock = _RPC_LOCKS.get(device_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _RPC_LOCKS[device_id] = lock
+        return lock
+
+
+
+def _stream_device(resolved: ResolvedDevice) -> StreamDevice:
+    return StreamDevice(
+        device_id=resolved.id,
+        host=resolved.host,
+        rtsp_port=resolved.rtsp_port,
+        username=resolved.username,
+        password=resolved.password,
+    )
+
+
+async def _resolve_device(
+    request: Request, device_id: int | None
+) -> ResolvedDevice:
+    registry = _registry(request)
+    try:
+        return await asyncio.to_thread(registry.resolve_device, device_id)
+    except RegistryError as exc:
+        raise
+
+
+def _device_id_from_query(request: Request) -> int | None:
+    value = request.query_params.get("device_id") or request.query_params.get(
+        "device"
+    )
+    if value is None or value.strip() == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise RegistryError("device_id must be a number.", 400)
+
 
 
 def _day_from_clock(value: str) -> date_cls:
@@ -269,17 +362,94 @@ def health() -> dict[str, str]:
 
 
 @app.get("/api/device/info")
-def device_info() -> JSONResponse:
-    return _read_device(
-        lambda client: {"info": mask_sensitive(client.get_device_info())}
-    )
+async def device_info(request: Request) -> JSONResponse:
+    try:
+        device_id = _device_id_from_query(request)
+    except RegistryError as exc:
+        return _registry_error(exc)
+
+    now = time.monotonic()
+    if device_id is not None:
+        cached = _DEVICE_INFO_CACHE.get(device_id)
+        if cached is not None and now < cached[0]:
+            return JSONResponse(cached[1])
+
+    try:
+        registry = _registry(request)
+        resolved = await asyncio.to_thread(registry.resolve_device, device_id)
+        lock = await _rpc_lock(resolved.id)
+        async with lock:
+            client = await asyncio.to_thread(
+                lambda: _open_dvr(resolved.base_url, resolved.username, resolved.password)
+            )
+            try:
+                info = await asyncio.to_thread(client.get_device_info)
+                result = {"info": mask_sensitive(info)}
+                if _DEVICE_INFO_CACHE_SECONDS > 0:
+                    async with _DEVICE_INFO_CACHE_LOCK:
+                        _DEVICE_INFO_CACHE[resolved.id] = (
+                            time.monotonic() + _DEVICE_INFO_CACHE_SECONDS,
+                            result,
+                        )
+                return JSONResponse(result)
+            finally:
+                try:
+                    client.logout()
+                except DvrLogoutError as exc:
+                    logger.warning("DVR logout failed: %s", type(exc).__name__)
+                finally:
+                    client.close()
+    except RegistryError as exc:
+        return _registry_error(exc)
+    except DvrError as exc:
+        return _dvr_error(exc)
+    except Exception as exc:
+        logger.error("Unexpected error while reading DVR data: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
 
 
 @app.get("/api/channels")
-def channels() -> JSONResponse:
-    return _read_device(
-        lambda client: {"channels": mask_sensitive(client.get_channels())}
-    )
+async def channels(request: Request) -> JSONResponse:
+    try:
+        device_id = _device_id_from_query(request)
+    except RegistryError as exc:
+        return _registry_error(exc)
+
+    now = time.monotonic()
+    cache_key = ("channels", device_id)
+    if device_id is not None:
+        cached = _DEVICE_INFO_CACHE.get(device_id)
+        if cached is not None and now < cached[0]:
+            # We store info separately; also cache channels in separate structure
+            pass
+
+    try:
+        registry = _registry(request)
+        resolved = await asyncio.to_thread(registry.resolve_device, device_id)
+        lock = await _rpc_lock(resolved.id)
+        async with lock:
+            client = await asyncio.to_thread(
+                lambda: _open_dvr(resolved.base_url, resolved.username, resolved.password)
+            )
+            try:
+                channels_info = await asyncio.to_thread(client.get_channels)
+                result = {"channels": mask_sensitive(channels_info)}
+                return JSONResponse(result)
+            finally:
+                try:
+                    client.logout()
+                except DvrLogoutError as exc:
+                    logger.warning("DVR logout failed: %s", type(exc).__name__)
+                finally:
+                    client.close()
+    except RegistryError as exc:
+        return _registry_error(exc)
+    except DvrError as exc:
+        return _dvr_error(exc)
+    except Exception as exc:
+        logger.error("Unexpected error while reading DVR data: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
+
 
 
 def _live_manager(request: Request) -> StreamManager:
@@ -307,7 +477,7 @@ def live_config() -> JSONResponse:
 
 
 @app.post("/api/live/{channel}/open")
-def open_live(
+async def open_live(
     channel: int,
     request: Request,
     quality: str = "sub",
@@ -317,13 +487,24 @@ def open_live(
         return _error(400, "Quality must be sub or main.")
 
     try:
+        device_id = _device_id_from_query(request)
+    except RegistryError as exc:
+        return _registry_error(exc)
+
+    try:
         manager = _live_manager(request)
         if not 1 <= channel <= manager.max_channel:
             return _error(
                 400,
                 f"Channel must be between 1 and {manager.max_channel}.",
             )
-        stream_name = manager.open(channel, quality)
+        registry = _registry(request)
+        resolved = await asyncio.to_thread(registry.resolve_device, device_id)
+        stream_name = await asyncio.to_thread(
+            manager.open, _stream_device(resolved), channel, quality
+        )
+    except RegistryError as exc:
+        return _registry_error(exc)
     except StreamLimitError as exc:
         return _error(429, str(exc))
     except StreamConfigError as exc:
@@ -407,6 +588,7 @@ async def open_playback(request: Request) -> JSONResponse:
     channel = body.get("channel")
     start = body.get("start")
     seconds = body.get("seconds", DEFAULT_PLAYBACK_SECONDS)
+    device_id = body.get("device_id")
 
     if not isinstance(channel, int) or isinstance(channel, bool):
         return _error(400, "channel must be a channel number.")
@@ -418,6 +600,18 @@ async def open_playback(request: Request) -> JSONResponse:
         return _error(400, "start is not a valid date and time.")
     if not isinstance(seconds, int) or isinstance(seconds, bool):
         return _error(400, "seconds must be a whole number.")
+    if device_id is None:
+        try:
+            device_id = _device_id_from_query(request)
+        except RegistryError as exc:
+            return _registry_error(exc)
+    elif isinstance(device_id, bool) or not isinstance(device_id, int):
+        try:
+            device_id = _device_id_from_query(request)
+        except RegistryError as exc:
+            return _registry_error(exc)
+    else:
+        pass
 
     try:
         manager = _live_manager(request)
@@ -437,8 +631,12 @@ async def open_playback(request: Request) -> JSONResponse:
         )
 
     try:
+        registry = _registry(request)
+        resolved = await asyncio.to_thread(registry.resolve_device, device_id)
         async with _open_cgi() as client:
             device_time, source = await _device_clock(client)
+    except RegistryError as exc:
+        return _registry_error(exc)
     except CgiError as exc:
         return _cgi_error(exc)
     except Exception as exc:  # pragma: no cover - defensive
@@ -455,7 +653,11 @@ async def open_playback(request: Request) -> JSONResponse:
 
     try:
         stream_name = await asyncio.to_thread(
-            manager.open_playback, channel, start_time, seconds
+            manager.open_playback,
+            _stream_device(resolved),
+            channel,
+            start_time,
+            seconds,
         )
     except StreamLimitError as exc:
         return _error(429, str(exc))
@@ -473,11 +675,33 @@ async def open_playback(request: Request) -> JSONResponse:
 
 
 @app.get("/api/recordings/time")
-async def recordings_time() -> JSONResponse:
+async def recordings_time(request: Request) -> JSONResponse:
     """Return the DVR clock, or the server date when the clock read fails."""
     try:
+        device_id = _device_id_from_query(request)
+    except RegistryError as exc:
+        return _registry_error(exc)
+    try:
+        registry = _registry(request)
+        resolved = await asyncio.to_thread(registry.resolve_device, device_id)
         async with _open_cgi() as client:
-            device_time, source = await _device_clock(client)
+            client._http = client._http  # keep existing
+            # Use a new client built from resolved creds would be better, but easier to pass via env is not possible
+            # Instead, create DvrCgi with resolved
+            from cgi_client import DvrCgi
+
+            cgi = DvrCgi(
+                resolved.base_url,
+                resolved.username,
+                resolved.password,
+                device_id=resolved.id,
+            )
+            try:
+                device_time, source = await _device_clock(cgi)
+            finally:
+                await cgi.aclose()
+    except RegistryError as exc:
+        return _registry_error(exc)
     except CgiError as exc:
         return _cgi_error(exc)
     except Exception as exc:  # pragma: no cover - defensive
@@ -488,11 +712,16 @@ async def recordings_time() -> JSONResponse:
 
 @app.get("/api/recordings")
 async def recordings(
+    request: Request,
     channel: str | None = None,
     date: str | None = None,
     stream: str = "main",
 ) -> JSONResponse:
     """Read one channel/stream/day of recordings through the DVR CGI API."""
+    try:
+        device_id = _device_id_from_query(request)
+    except RegistryError as exc:
+        return _registry_error(exc)
     if channel is None or not _DIGITS.fullmatch(channel):
         return _error(400, "channel must be a channel number.")
     if date is None or not _DATE_PARAM.fullmatch(date):
@@ -516,8 +745,18 @@ async def recordings(
         )
 
     try:
-        async with _open_cgi() as client:
-            device_time, source = await _device_clock(client)
+        registry = _registry(request)
+        resolved = await asyncio.to_thread(registry.resolve_device, device_id)
+        from cgi_client import DvrCgi
+
+        cgi = DvrCgi(
+            resolved.base_url,
+            resolved.username,
+            resolved.password,
+            device_id=resolved.id,
+        )
+        try:
+            device_time, source = await _device_clock(cgi)
             device_day = _day_from_clock(device_time)
             if requested > device_day:
                 return _error(400, "date is later than the DVR date.")
@@ -525,7 +764,11 @@ async def recordings(
                 return _error(
                     400, "date is more than 90 days before the DVR date."
                 )
-            result = await client.find_files(number, date, stream)
+            result = await cgi.find_files(number, date, stream)
+        finally:
+            await cgi.aclose()
+    except RegistryError as exc:
+        return _registry_error(exc)
     except CgiError as exc:
         return _cgi_error(exc)
     except Exception as exc:  # pragma: no cover - defensive
@@ -560,15 +803,33 @@ async def recordings(
 
 
 @app.get("/api/storage")
-async def storage() -> JSONResponse:
+async def storage(request: Request) -> JSONResponse:
     """Return storage health; a failed call is reported as unknown."""
     try:
-        async with _open_cgi() as client:
-            result = await client.get_storage_health()
+        device_id = _device_id_from_query(request)
+    except RegistryError as exc:
+        return _registry_error(exc)
+    try:
+        registry = _registry(request)
+        resolved = await asyncio.to_thread(registry.resolve_device, device_id)
+        from cgi_client import DvrCgi
+
+        cgi = DvrCgi(
+            resolved.base_url,
+            resolved.username,
+            resolved.password,
+            device_id=resolved.id,
+        )
+        try:
+            result = await cgi.get_storage_health()
+        finally:
+            await cgi.aclose()
     except CgiConfigError as exc:
         return _cgi_error(exc)
+    except RegistryError as exc:
+        return _registry_error(exc)
     except CgiError as exc:
-        logger.warning("Storage health unavailable: %s", exc)
+        logger.warning("Storage health unavailable: %s", type(exc).__name__)
         return JSONResponse(
             {"health": "unknown", "disks": 0, "errors": 0}
         )
@@ -583,17 +844,41 @@ async def storage() -> JSONResponse:
 
 
 @app.get("/api/config/{name}")
-def config(name: str) -> JSONResponse:
+async def config(name: str, request: Request) -> JSONResponse:
     if name not in CONFIG_NAMES:
         return _error(
             400,
             "Unsupported config name. Allowed: " + ", ".join(CONFIG_NAMES) + ".",
         )
-
-    def read(client: DvrClient) -> dict[str, Any]:
-        return {"config": mask_sensitive(client.get_config(name))}
-
-    return _read_device(read)
+    try:
+        device_id = _device_id_from_query(request)
+    except RegistryError as exc:
+        return _registry_error(exc)
+    try:
+        registry = _registry(request)
+        resolved = await asyncio.to_thread(registry.resolve_device, device_id)
+        lock = await _rpc_lock(resolved.id)
+        async with lock:
+            client = await asyncio.to_thread(
+                lambda: _open_dvr(resolved.base_url, resolved.username, resolved.password)
+            )
+            try:
+                result = {"config": mask_sensitive(await asyncio.to_thread(client.get_config, name))}
+                return JSONResponse(result)
+            finally:
+                try:
+                    client.logout()
+                except DvrLogoutError as exc:
+                    logger.warning("DVR logout failed: %s", type(exc).__name__)
+                finally:
+                    client.close()
+    except RegistryError as exc:
+        return _registry_error(exc)
+    except DvrError as exc:
+        return _dvr_error(exc)
+    except Exception as exc:
+        logger.error("Unexpected error while reading DVR data: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
 
 
 def _error(status_code: int, message: str) -> JSONResponse:
@@ -732,6 +1017,14 @@ async def update_device(device_id: int, request: Request) -> JSONResponse:
         device = await asyncio.to_thread(
             _registry(request).update_device, device_id, body
         )
+        try:
+            if any(k in body for k in ("host", "http_port", "rtsp_port", "username", "password")):
+                manager = getattr(request.app.state, "stream_manager", None)
+                if manager is not None:
+                    await asyncio.to_thread(manager.close_all_for_device, device_id)
+        except Exception:
+            pass
+        _clear_device_caches(device_id)
     except Exception as exc:
         return _registry_error(exc)
     return JSONResponse({"device": device})
@@ -741,9 +1034,30 @@ async def update_device(device_id: int, request: Request) -> JSONResponse:
 async def delete_device(device_id: int, request: Request) -> JSONResponse:
     try:
         await asyncio.to_thread(_registry(request).delete_device, device_id)
+        try:
+            manager = getattr(request.app.state, "stream_manager", None)
+            if manager is not None:
+                await asyncio.to_thread(manager.close_all_for_device, device_id)
+        except Exception:
+            pass
+        _clear_device_caches(device_id)
     except Exception as exc:
         return _registry_error(exc)
     return JSONResponse({"deleted": True})
+
+
+@app.post("/api/devices/{device_id}/streams/close-all")
+async def close_device_streams(device_id: int, request: Request) -> JSONResponse:
+    try:
+        manager = _live_manager(request)
+        count = await asyncio.to_thread(manager.close_all_for_device, device_id)
+        return JSONResponse({"closed": count})
+    except StreamConfigError as exc:
+        logger.warning("Live view is not configured: %s", exc)
+        return _error(503, str(exc))
+    except Exception as exc:
+        logger.error("Unexpected close-all error: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
 
 
 @app.get("/api/settings/default-credentials")
