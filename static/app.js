@@ -37,6 +37,20 @@ const liveLargeTitle = document.getElementById("live-large-title");
 const liveLargeFrame = document.getElementById("live-large-frame");
 const liveLargeClose = document.getElementById("live-large-close");
 
+const recChannel = document.getElementById("rec-channel");
+const recDate = document.getElementById("rec-date");
+const recStream = document.getElementById("rec-stream");
+const recLoad = document.getElementById("rec-load");
+const recHealth = document.getElementById("rec-health");
+const recStatus = document.getElementById("rec-status");
+const recSummary = document.getElementById("rec-summary");
+const recTimelineWrap = document.getElementById("rec-timeline-wrap");
+const recTimeline = document.getElementById("rec-timeline");
+const recCursor = document.getElementById("rec-cursor");
+const recSelected = document.getElementById("rec-selected");
+const recFilesDetails = document.getElementById("rec-files-details");
+const recFiles = document.getElementById("rec-files");
+
 const CALL_METADATA_KEYS = new Set(["succeeded_calls", "failed_calls"]);
 const MAX_TABLE_ROWS = 400;
 const LIVE_FALLBACK_CHANNELS = 4;
@@ -44,6 +58,8 @@ const LIVE_RENEW_INTERVAL_MS = 10000;
 const LIVE_START_GAP_MS = 400;
 const LIVE_INCLUDE_KEY_PREFIX = "dvr-live-include-";
 const DEFAULT_MAX_CHANNEL = 8;
+const DAY_SECONDS = 86400;
+const MAX_RECORDING_ROWS = 400;
 
 const liveState = {
   publicUrl: null,
@@ -53,6 +69,12 @@ const liveState = {
   renewTimer: null,
   connecting: false,
   disconnecting: false,
+};
+
+const recordingsState = {
+  loading: false,
+  requestId: 0,
+  date: null,
 };
 
 function formatValue(value) {
@@ -324,6 +346,7 @@ function renderChannels(channels) {
   );
   channelsRaw.textContent = JSON.stringify(channels, null, 2);
   syncLiveTiles(typeof count === "number" ? count : null);
+  syncRecordingChannels(typeof count === "number" ? count : null);
 
   if (failedCalls.length > 0) {
     setSectionNote(
@@ -462,6 +485,7 @@ async function loadChannels() {
     channelCounts.replaceChildren();
     channelsRaw.textContent = "—";
     syncLiveTiles(null);
+    syncRecordingChannels(null);
   }
 }
 
@@ -507,6 +531,388 @@ function syncLiveTiles(count) {
     return;
   }
   createLiveTiles(desired);
+}
+
+function syncRecordingChannels(count) {
+  const desired = desiredChannelCount(count);
+  const report = count === null || count === undefined ? "" : String(count);
+  const previous = Number.parseInt(recChannel.value, 10);
+  if (
+    recChannel.options.length === desired &&
+    recChannel.dataset.count === report
+  ) {
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (let channel = 1; channel <= desired; channel += 1) {
+    const option = document.createElement("option");
+    option.value = String(channel);
+    option.textContent = `Channel ${channel}`;
+    fragment.append(option);
+  }
+  recChannel.replaceChildren(fragment);
+  recChannel.dataset.count = report;
+  if (Number.isInteger(previous) && previous >= 1 && previous <= desired) {
+    recChannel.value = String(previous);
+  }
+}
+
+function pad2(value) {
+  return String(value).padStart(2, "0");
+}
+
+function secondsIntoDay(text, day) {
+  const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(
+    String(text || ""),
+  );
+  if (!match) {
+    return null;
+  }
+  const datePart = `${match[1]}-${match[2]}-${match[3]}`;
+  if (datePart < day) {
+    return 0;
+  }
+  if (datePart > day) {
+    return DAY_SECONDS;
+  }
+  return (
+    Number(match[4]) * 3600 + Number(match[5]) * 60 + Number(match[6])
+  );
+}
+
+function formatDaySeconds(seconds) {
+  const value = Math.min(Math.max(0, Math.round(seconds)), DAY_SECONDS - 1);
+  return `${pad2(Math.floor(value / 3600))}:${pad2(
+    Math.floor((value % 3600) / 60),
+  )}:${pad2(value % 60)}`;
+}
+
+function formatBytes(value) {
+  if (!Number.isFinite(value) || value < 0) {
+    return "—";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function clearRecordings() {
+  recordingsState.date = null;
+  recSummary.hidden = true;
+  recSummary.textContent = "";
+  recSummary.className = "section-note";
+  recTimelineWrap.hidden = true;
+  recFilesDetails.hidden = true;
+  recFilesDetails.open = false;
+  recFiles.replaceChildren();
+  for (const bar of recTimeline.querySelectorAll(".rec-bar")) {
+    bar.remove();
+  }
+  recCursor.hidden = true;
+  recSelected.textContent = "Click the timeline to mark a time.";
+}
+
+function renderTimeline(files, day) {
+  for (const bar of recTimeline.querySelectorAll(".rec-bar")) {
+    bar.remove();
+  }
+  const fragment = document.createDocumentFragment();
+  for (const file of files) {
+    const start = secondsIntoDay(file?.start, day);
+    const end = secondsIntoDay(file?.end, day);
+    if (start === null || end === null || end <= start) {
+      continue;
+    }
+    const left = Math.min(
+      100,
+      Math.max(0, (start / DAY_SECONDS) * 100),
+    );
+    const width = Math.min(
+      100 - left,
+      Math.max(0.12, ((end - start) / DAY_SECONDS) * 100),
+    );
+    const bar = document.createElement("span");
+    bar.className = "rec-bar";
+    bar.style.left = `${left}%`;
+    bar.style.width = `${width}%`;
+    bar.title = `${formatValue(file.start)} → ${formatValue(
+      file.end,
+    )} · ${formatBytes(file.length_bytes)}`;
+    fragment.append(bar);
+  }
+  recTimeline.insertBefore(fragment, recCursor);
+}
+
+function renderRecordingFiles(files) {
+  if (files.length === 0) {
+    recFiles.replaceChildren(
+      emptyNode("No recording files were reported for this day."),
+    );
+    return;
+  }
+
+  const table = document.createElement("table");
+  table.className = "config-table rec-table";
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const label of ["Start", "End", "Type", "Flags", "Size"]) {
+    const cell = document.createElement("th");
+    cell.scope = "col";
+    cell.textContent = label;
+    headRow.append(cell);
+  }
+  head.append(headRow);
+
+  const body = document.createElement("tbody");
+  for (const file of files.slice(0, MAX_RECORDING_ROWS)) {
+    const row = document.createElement("tr");
+    const values = [
+      formatValue(file?.start),
+      formatValue(file?.end),
+      formatValue(file?.type),
+      Array.isArray(file?.flags) && file.flags.length > 0
+        ? file.flags.join(", ")
+        : "—",
+      formatBytes(file?.length_bytes),
+    ];
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.append(cell);
+    }
+    body.append(row);
+  }
+  table.append(head, body);
+
+  const fragment = document.createDocumentFragment();
+  fragment.append(table);
+  if (files.length > MAX_RECORDING_ROWS) {
+    fragment.append(
+      emptyNode(
+        `Showing the first ${MAX_RECORDING_ROWS} of ${files.length} files.`,
+      ),
+    );
+  }
+  recFiles.replaceChildren(fragment);
+}
+
+function renderRecordings(payload, channel, date, stream) {
+  const label = `${stream === "main" ? "Main" : "Sub"} channel ${channel} on ${date}`;
+  const sourceNote =
+    payload?.device_time_source === "server"
+      ? " The DVR clock could not be read, so dates use the server clock."
+      : "";
+
+  if (!payload || payload.available !== true) {
+    clearRecordings();
+    const reason =
+      typeof payload?.reason === "string" && payload.reason.trim() !== ""
+        ? payload.reason.trim()
+        : "The DVR did not return recordings.";
+    const ending = /[.!?]$/.test(reason) ? "" : ".";
+    setSectionNote(
+      recStatus,
+      "warn",
+      `Recordings are unavailable on this device: ${reason}${ending}${sourceNote}`,
+    );
+    return;
+  }
+
+  const files = Array.isArray(payload.files) ? payload.files : [];
+  const gaps = Array.isArray(payload.gaps) ? payload.gaps : [];
+  const truncated = payload.truncated === true;
+  const coverage = Number.isFinite(payload.coverage_percent)
+    ? payload.coverage_percent
+    : 0;
+  const lastEnd =
+    typeof payload.last_end === "string" ? payload.last_end : null;
+
+  recordingsState.date = date;
+  renderTimeline(files, date);
+  recTimelineWrap.hidden = false;
+  recCursor.hidden = true;
+  recSelected.textContent = "Click the timeline to mark a time.";
+  renderRecordingFiles(files);
+  recFilesDetails.hidden = false;
+  recFilesDetails.open = false;
+
+  recSummary.textContent = `${label}: ${coverage.toFixed(
+    1,
+  )}% of the day covered · last recording ${
+    lastEnd ? `ends ${lastEnd}` : "not reported"
+  } · ${gaps.length} gap${gaps.length === 1 ? "" : "s"} of 5 minutes or more.`;
+  recSummary.className = "section-note";
+  recSummary.hidden = false;
+
+  const parts = [
+    `${label}: ${files.length} file${files.length === 1 ? "" : "s"} loaded.`,
+  ];
+  if (truncated) {
+    parts.push(
+      "The list was truncated after 30 pages (3000 files); " +
+        "the summary may be incomplete.",
+    );
+  }
+  if (sourceNote) {
+    parts.push(sourceNote.trim());
+  }
+  setSectionNote(
+    recStatus,
+    truncated || sourceNote ? "warn" : files.length > 0 ? "ok" : "warn",
+    parts.join(" "),
+  );
+}
+
+async function loadRecordings() {
+  if (recordingsState.loading) {
+    return;
+  }
+  const channel = Number.parseInt(recChannel.value, 10);
+  const date = recDate.value;
+  const stream = recStream.value === "sub" ? "sub" : "main";
+
+  if (!Number.isInteger(channel)) {
+    setSectionNote(recStatus, "error", "Choose a channel before loading.");
+    return;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    setSectionNote(recStatus, "error", "Choose a date before loading.");
+    return;
+  }
+
+  recordingsState.loading = true;
+  recordingsState.requestId += 1;
+  const requestId = recordingsState.requestId;
+  recLoad.disabled = true;
+  recLoad.textContent = "Loading…";
+  setSectionNote(
+    recStatus,
+    "loading",
+    `Loading ${stream === "main" ? "main" : "sub"} recordings…`,
+  );
+
+  try {
+    const params = new URLSearchParams({
+      channel: String(channel),
+      date,
+      stream,
+    });
+    const payload = await fetchJson(`/api/recordings?${params.toString()}`);
+    if (requestId === recordingsState.requestId) {
+      renderRecordings(payload, channel, date, stream);
+    }
+  } catch (error) {
+    if (requestId === recordingsState.requestId) {
+      clearRecordings();
+      setSectionNote(
+        recStatus,
+        "error",
+        error.message || "Could not load recordings.",
+      );
+    }
+  } finally {
+    if (requestId === recordingsState.requestId) {
+      recordingsState.loading = false;
+      recLoad.disabled = false;
+      recLoad.textContent = "Load";
+    }
+  }
+}
+
+async function loadRecordingsTime() {
+  if (recDate.value) {
+    return;
+  }
+  try {
+    const payload = await fetchJson("/api/recordings/time");
+    const value =
+      typeof payload?.device_time === "string"
+        ? payload.device_time.slice(0, 10)
+        : "";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      throw new Error("The server did not return the DVR date.");
+    }
+    recDate.value = value;
+    if (payload?.source === "server") {
+      setSectionNote(
+        recStatus,
+        "warn",
+        "The DVR clock could not be read; the date comes from the server clock.",
+      );
+    } else {
+      setSectionNote(
+        recStatus,
+        "ok",
+        `Date set to ${value}. Press Load to list recordings.`,
+      );
+    }
+  } catch {
+    const now = new Date();
+    recDate.value = `${now.getFullYear()}-${pad2(
+      now.getMonth() + 1,
+    )}-${pad2(now.getDate())}`;
+    setSectionNote(
+      recStatus,
+      "warn",
+      "The DVR date could not be read; choose a date and press Load.",
+    );
+  }
+}
+
+async function loadStorageHealth() {
+  recHealth.className = "badge";
+  recHealth.textContent = "Storage…";
+  recHealth.title = "Reading storage health.";
+  try {
+    const payload = await fetchJson("/api/storage");
+    const partitions = Number.isInteger(payload?.partitions)
+      ? payload.partitions
+      : 0;
+    const errors = Number.isInteger(payload?.errors) ? payload.errors : 0;
+    if (payload?.health === "ok") {
+      recHealth.className = "badge ok";
+      recHealth.textContent = "Storage ok";
+    } else if (payload?.health === "problem") {
+      recHealth.className = "badge warn";
+      recHealth.textContent = "Storage problem";
+    } else {
+      recHealth.className = "badge";
+      recHealth.textContent = "Storage unknown";
+    }
+    recHealth.title = `${partitions} partition${
+      partitions === 1 ? "" : "s"
+    }, ${errors} reported error${errors === 1 ? "" : "s"}.`;
+  } catch {
+    recHealth.className = "badge";
+    recHealth.textContent = "Storage unknown";
+    recHealth.title = "Storage health could not be read.";
+  }
+}
+
+function markTimelineTime(event) {
+  const rect = recTimeline.getBoundingClientRect();
+  if (rect.width <= 0) {
+    return;
+  }
+  const ratio = Math.min(
+    1,
+    Math.max(0, (event.clientX - rect.left) / rect.width),
+  );
+  const seconds = Math.min(
+    DAY_SECONDS - 1,
+    Math.round(ratio * DAY_SECONDS),
+  );
+  recCursor.hidden = false;
+  recCursor.style.left = `${(ratio * 100).toFixed(3)}%`;
+  recSelected.textContent = `Marked ${formatDaySeconds(
+    seconds,
+  )} on ${recordingsState.date || recDate.value}. Playback comes in a later phase.`;
 }
 
 function readInclude(channel) {
@@ -1086,6 +1492,7 @@ async function loadLiveConfig() {
   }
 
   syncLiveTiles(null);
+  syncRecordingChannels(null);
   updateLiveButtons();
 }
 
@@ -1096,6 +1503,8 @@ async function loadAll() {
   await loadLiveConfig();
   await loadDeviceInfo();
   await loadChannels();
+  await loadRecordingsTime();
+  await loadStorageHealth();
   await loadConfig("Network", networkStatus, networkTable, networkRaw);
   await loadConfig("Encode", encodeStatus, encodeTable, encodeRaw);
   setLoading(false);
@@ -1105,6 +1514,9 @@ refreshButton.addEventListener("click", loadAll);
 liveConnect.addEventListener("click", connectAll);
 liveDisconnect.addEventListener("click", disconnectAll);
 liveLargeClose.addEventListener("click", closeLarge);
+recLoad.addEventListener("click", loadRecordings);
+recTimeline.addEventListener("click", markTimelineTime);
 window.addEventListener("pagehide", closeAllOnUnload);
+syncRecordingChannels(null);
 updateLiveButtons();
 loadAll();

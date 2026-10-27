@@ -1,9 +1,10 @@
-# DVR Web — Phase 3b
+# DVR Web — Phase 4a
 
 A small, read-only web app for a Dahua DVR on the local network. It logs in to
 the DVR, reads device identity, video input channels, and selected configuration,
-and shows them in the browser. Phase 3b adds lease-based stream expiry, a
-Connect action that starts every included channel, and UI fixes.
+and shows them in the browser. Phase 3b adds lease-based live streaming through
+go2rtc. Phase 4a adds a read-only recordings list, a 24-hour timeline, and
+storage health through the DVR HTTP CGI API.
 
 All DVR API behavior is based strictly on [`api_spec.md`](api_spec.md) and the
 current `har_summary.txt`. Points that the sources do not document are marked as
@@ -12,15 +13,18 @@ write methods and never sends a set/write/reboot/format call.
 
 Live video is separate from the DVR JSON-RPC session: the live path uses RTSP
 through go2rtc and does not call `DvrClient` or add any DVR RPC calls.
+Recordings and storage use the DVR HTTP CGI API with Digest authentication and
+do not use the RPC session either. No media is downloaded.
 
 ## Project layout
 
 | File | Purpose |
 | --- | --- |
 | `dvr_client.py` | `DvrClient`: one instance per DVR session; `login()`, `keepalive()`, `get_device_info()`, `get_channels()`, `get_config(name)`, `logout()`, context-manager support |
+| `cgi_client.py` | Read-only DVR CGI client: device clock, `findFile`/`findNextFile` paging, `close`/`destroy` cleanup, storage health, recording cache, and per-device lock |
 | `stream_manager.py` | On-demand go2rtc streams, leases, limits, and cleanup; builds the RTSP URL server-side |
-| `app.py` | FastAPI app: `/`, `/health`, `/api/device/info`, `/api/channels`, `/api/config` (live config), `/api/config/{name}` (DVR config), `/api/live/{channel}/open`, `/api/live/renew`, `/api/live/{stream_name}/close`, plus the lease reaper |
-| `static/` | Plain HTML/CSS/JS frontend (no build step), including the Live view |
+| `app.py` | FastAPI app: `/`, `/health`, `/api/device/info`, `/api/channels`, `/api/config` (live config), `/api/config/{name}` (DVR config), `/api/live/{channel}/open`, `/api/live/renew`, `/api/live/{stream_name}/close`, `/api/recordings`, `/api/recordings/time`, `/api/storage`, plus the lease reaper |
+| `static/` | Plain HTML/CSS/JS frontend (no build step), including Live and Recordings |
 | `test_dvr.py` | Manual login → device/channels/config reads → logout smoke test |
 | `.env.example` | Placeholder configuration to copy to `.env` |
 | `api_spec.md` | DVR API notes this implementation is based on |
@@ -80,6 +84,13 @@ LEASE_TIMEOUT_SECONDS=30
 LEASE_CHECK_INTERVAL_SECONDS=5
 ```
 
+Phase 4a adds these recording settings:
+
+```dotenv
+RESPONSE_CHANNEL_OFFSET=-1
+RECORDINGS_CACHE_SECONDS=60
+```
+
 - `GO2RTC_URL` is what the backend calls. It should normally stay on loopback.
 - `PUBLIC_GO2RTC_URL` is what the browser uses for the player iframe. Through the
   SSH tunnel it is also `http://127.0.0.1:1984`.
@@ -93,12 +104,20 @@ LEASE_CHECK_INTERVAL_SECONDS=5
 - `LEASE_TIMEOUT_SECONDS` is how long a stream survives without a renewal.
 - `LEASE_CHECK_INTERVAL_SECONDS` is how often the background reaper checks for
   expired leases.
+- `RESPONSE_CHANNEL_OFFSET` is added to the requested channel number when
+  filtering `findNextFile` items. The measured device reports the requested
+  channel one number lower, so the default is `-1`. This is TODO(spec): it was
+  measured on one device only.
+- `RECORDINGS_CACHE_SECONDS` is how long one channel/date/stream finder result is
+  kept in memory. `0` disables the cache.
 
 `DVR_HOST` may include a scheme and port, for example
 `http://192.168.1.100:80`. If no scheme is given, `http://` is used. The RTSP
 port is fixed at `554` because that is the measured DVR behaviour; the web port
-in `DVR_HOST` is not reused for RTSP. `python-dotenv` loads `.env` at runtime.
-The app never sends the username, password, RTSP URL, or session id to the
+in `DVR_HOST` is not reused for RTSP. Do not put a username or password in
+`DVR_HOST`; credentials belong in `DVR_USER` and `DVR_PASS`, and a URL with
+userinfo is rejected. `python-dotenv` loads `.env` at runtime. The app never
+sends the username, password, RTSP URL, session id, or DVR file path to the
 browser, and never logs them.
 
 ## Run
@@ -218,6 +237,58 @@ with appropriate permissions; it can contain DVR credentials. Do not commit it
 or paste it into issue reports. Startup cleanup assumes this app is the only
 consumer of the `cctv-` prefix.
 
+## Recordings and storage (Phase 4a)
+
+The **Recordings** section sits directly after Live. It has a channel select
+(from the reported channel count, capped by `MAX_CHANNEL`), a date input, a
+Main/Sub select, and a **Load** button. Nothing is loaded automatically: the
+page only reads the device date and storage health on load/refresh; recordings
+are read when **Load** is pressed.
+
+- The date input is filled from `GET /api/recordings/time`, which reads the DVR
+  clock. If the clock read fails, the server date is used and the section says
+  so.
+- `Main` maps to the DVR's `VideoStream=Main`; `Sub` maps to `Extra1`.
+- Items are filtered to the requested channel with
+  `item.Channel == channel + RESPONSE_CHANNEL_OFFSET`, then sorted by start.
+- The 24-hour timeline draws one plain-CSS bar per file at its position in the
+  day. Empty space is a gap. Clicking the timeline only moves a marker and shows
+  the marked time as text; playback is not implemented.
+- Coverage is the merged, day-clamped recording time divided by 86,400
+  seconds. Overlapping or adjacent files are merged. Only gaps of 5 minutes or
+  more are listed (including a leading or trailing gap when files exist).
+- The summary line shows coverage percent, the last recording end, and the gap
+  count. The file table is inside a closed **Files** `<details>`; at most 400
+  rows are rendered, with a note when the backend returned more.
+- The storage badge shows `ok`, `problem`, or `unknown`. A recorder that
+  overwrites old data can report `UsedBytes == TotalBytes`; that is not treated
+  as a problem. `problem` means a partition state other than `Success` or a
+  detail `IsError=true`. A failed storage call is `unknown`.
+- If the DVR answers `findFile` with `Error / Bad Request!`, the section shows
+  "Recordings are unavailable on this device" with that reason. It is not a
+  server error.
+- If a finder reaches 30 pages of 100 files (3,000 files), the response is
+  marked `truncated` and the section warns that the summary may be incomplete.
+
+Backend behavior:
+
+- Each request creates one CGI client with `httpx.DigestAuth`, a 10-second
+  timeout, and redirects disabled. Credentials come from `DVR_HOST`,
+  `DVR_USER`, and `DVR_PASS`.
+- A module-level lock serializes finder sessions per DVR host, so two requests
+  never run two finders on the same device at once.
+- `factory.create` returns the finder object. `findFile` queries the requested
+  day from `00:00:00` to `23:59:59`. `findNextFile&count=100` is repeated until
+  `found < 100`, with a hard cap of 30 pages.
+- `close` and `destroy` always run for the same object in a `finally` block,
+  including on bad-request and transport failures.
+- Finder results are cached in memory per `(host, channel, date, stream)` for
+  `RECORDINGS_CACHE_SECONDS`. Unavailable results are cached too.
+- The DVR's internal `FilePath` field is discarded while parsing. It is never
+  returned, rendered, logged, or included in an error.
+- Read-only: this phase never calls a set/write/delete/format/reboot/download
+  action and never downloads media.
+
 ## Test the client
 
 ```powershell
@@ -244,6 +315,14 @@ With `--verify-logout`, the client logs out and then makes exactly one
 `global.keepAlive` request with the old session. It reports whether that session
 was rejected (closed), was still accepted, or could not be determined. No retry
 is made.
+
+Phase 4a was additionally checked with a separate mock-transport suite that is
+not shipped in the project. It covered multi-page `findNextFile` parsing, the
+100-item boundary, 30-page truncation, `close`/`destroy` on success, bad-request
+and page-error paths, channel-offset filtering, Main/Extra1 separation, coverage
+and gap math across midnight, cache hit/expiry, per-device lock serialization,
+parameter/date validation, `available: false` handling, and the absence of
+credentials and `FilePath` from responses and logs.
 
 ## Test live view on the Ubuntu server
 
@@ -351,6 +430,59 @@ Invoke-RestMethod http://127.0.0.1:8000/api/channels
 Invoke-RestMethod http://127.0.0.1:8000/api/config/Encode
 ```
 
+## Test recordings and storage on the Ubuntu server
+
+Run these after the live test, with uvicorn on loopback and the SSH tunnel open.
+Edit `.env` with your own editor; never paste its contents into a shell history,
+chat, or issue.
+
+1. Set `DVR_HOST` to the DVR that has recordings, keep `DVR_USER` and
+   `DVR_PASS`, leave `RESPONSE_CHANNEL_OFFSET=-1`, and leave
+   `RECORDINGS_CACHE_SECONDS=60`. Restart uvicorn so the new settings are read.
+
+2. Open <http://127.0.0.1:8000>. The Recordings section is below Live. The date
+   input should show the DVR's current date. The storage badge should show
+   **Storage ok**; compare it with the storage/HDD page in Smart PSS. A recorder
+   that overwrites old data showing `UsedBytes == TotalBytes` is still `ok`.
+
+3. Select the channel with the camera (for example channel 2), keep the date on
+   a recent day that has recordings, choose **Main**, and press **Load**. The
+   summary, timeline, and closed **Files** details should appear. Nothing should
+   have loaded before Load was pressed.
+
+4. In Smart PSS, search the same channel and date for Main-stream recordings.
+   Compare the first start time and the last end time with the summary and the
+   first/last rows under **Files**. Compare gaps of 5 minutes or more with the
+   Smart PSS timeline. If the channel is off by one, verify
+   `RESPONSE_CHANNEL_OFFSET` on this device before changing it.
+
+5. Switch to **Sub**, press **Load**, and repeat the comparison for the
+   `Extra1` files.
+
+6. Click the timeline at a few positions. Only the red marker and the marked
+   time text should change; there must be no playback or media download request
+   in the browser network panel.
+
+7. Press **Load** again within `RECORDINGS_CACHE_SECONDS` (60 seconds by
+   default). The same result should return from the in-memory cache. To compare
+   uncached behavior, set `RECORDINGS_CACHE_SECONDS=0`, restart uvicorn, and
+   load again.
+
+8. Test the "unavailable" path. Stop uvicorn, set `DVR_HOST` to the DVR that
+   answers `findFile` with `Error / Bad Request!`, restart, and press **Load**
+   for a recent date. The section should show
+   "Recordings are unavailable on this device: Error / Bad Request!" and the
+   HTTP response should be `200`, not `502`. Restore the working DVR afterward.
+
+9. Optional truncation test: use a day with more than 3,000 matching files.
+   The response should have `"truncated": true` and the section should warn that
+   the list was capped after 30 pages. The first 3,000 items are still used for
+   the timeline and summary.
+
+10. With the browser network panel open, inspect the `/api/recordings` JSON.
+    Confirm there is no `FilePath` key and no internal DVR path value. Do not
+    paste the response body into a report.
+
 ## API
 
 ### `GET /health`
@@ -427,6 +559,108 @@ Deletes one stream and removes its lease. The response is `{"closed": true}`. It
 is safe to call twice: an unknown or already-closed name is treated as closed and
 is not forwarded to go2rtc. A malformed name returns `400`; a go2rtc deletion
 failure returns `502`.
+
+### `GET /api/recordings/time`
+
+Reads the DVR clock through the CGI API. The date input uses this so "today"
+means the DVR's day, not the server's:
+
+```json
+{
+  "device_time": "2026-10-27 12:34:56",
+  "source": "device"
+}
+```
+
+If the clock read fails after authentication, the server clock is used and
+`source` is `"server"`; the UI shows that fallback. A configuration problem
+returns `503`; a network or authentication failure returns `502`.
+
+### `GET /api/recordings?channel=<n>&date=YYYY-MM-DD&stream=main|sub`
+
+Reads one channel/stream/day through the DVR CGI API. `channel` must be between
+`1` and `MAX_CHANNEL`; `stream` defaults to `main`. All times are the DVR's naive
+local time; no timezone conversion is done.
+
+Successful response:
+
+```json
+{
+  "available": true,
+  "device_time": "2026-10-27 12:34:56",
+  "device_time_source": "device",
+  "date": "2026-10-27",
+  "channel": 2,
+  "stream": "main",
+  "files": [
+    {
+      "start": "2026-10-27 00:00:00",
+      "end": "2026-10-27 01:00:00",
+      "type": "dav",
+      "flags": ["Timing"],
+      "length_bytes": 123456
+    }
+  ],
+  "coverage_seconds": 3600,
+  "coverage_percent": 4.2,
+  "last_end": "2026-10-27 01:00:00",
+  "gaps": [
+    {
+      "start": "2026-10-27 01:00:00",
+      "end": "2026-10-27 23:59:59"
+    }
+  ],
+  "truncated": false
+}
+```
+
+`files` is filtered to the requested channel and `VideoStream` (`main` → `Main`,
+`sub` → `Extra1`), sorted by start, and contains no `FilePath`. Coverage merges
+and clamps intervals to the day; gaps shorter than 5 minutes are omitted.
+`truncated` becomes `true` after 30 pages of 100 files.
+
+A DVR that rejects `findFile` returns `200`:
+
+```json
+{
+  "available": false,
+  "reason": "Error / Bad Request!",
+  "device_time": "2026-10-27 12:34:56",
+  "device_time_source": "device",
+  "date": "2026-10-27",
+  "channel": 2,
+  "stream": "main"
+}
+```
+
+Status codes:
+
+- `400` — missing or non-numeric channel, channel outside `1..MAX_CHANNEL`,
+  malformed or impossible date, unsupported stream, a date later than the DVR
+  date, or a date more than 90 days before the DVR date.
+- `200` — recordings listed, or `available: false` for a rejected finder.
+- `502` — network or authentication failure.
+- `503` — missing CGI configuration or an unusable CGI response.
+
+One finder session runs per DVR host at a time. Results are cached for
+`RECORDINGS_CACHE_SECONDS` keyed by host, channel, date, and stream.
+
+### `GET /api/storage`
+
+Reads the CGI storage device information and returns only a small health summary:
+
+```json
+{"health": "ok", "partitions": 2, "errors": 0}
+```
+
+- `ok` — every reported partition is `State=Success` and no detail
+  `IsError=true`.
+- `problem` — a partition has another state, or a detail reports an error.
+- `unknown` — no partitions were reported or the storage call failed.
+
+`UsedBytes == TotalBytes` is deliberately ignored: a recorder that overwrites old
+data can report that with healthy storage. A failed call is still HTTP `200`
+with `health: "unknown"`; only a configuration problem returns `503`.
 
 ### `GET /api/device/info`
 
@@ -536,6 +770,19 @@ raw DVR payload.
 - The RTSP URL, DVR username/password, and go2rtc API responses stay on the
   backend. The browser receives only an opaque `cctv-` stream name and the
   configured `PUBLIC_GO2RTC_URL`.
+- The CGI client uses `httpx.DigestAuth`, a 10-second timeout, and no redirects.
+  Logs contain fixed action names, status codes, and safe messages only; request
+  URLs, credentials, response bodies, and `FilePath` values are never logged.
+- The recordings parser drops the DVR's internal `FilePath` before any result is
+  cached or returned. Finder errors return a short first line with URLs and
+  `FilePath` text hidden; `FilePath` never reaches the browser.
+- `close` and `destroy` always run for a created finder object in a `finally`
+  block. The finder is capped at 30 pages; no media is downloaded.
+- The storage endpoint returns only `health`, partition count, and error count.
+  It does not return serial numbers, model strings, or raw storage records.
+- The recordings cache holds file times, types, flags, and sizes only. It is
+  in memory, keyed by host/channel/date/stream, and expires after
+  `RECORDINGS_CACHE_SECONDS`.
 - go2rtc persists API-added streams, including their RTSP source with
   credentials, in its own config. The cleanup rules above remove this app's
   streams; protect the go2rtc config file and never commit or paste it.
@@ -672,9 +919,9 @@ used by this phase.
     go2rtc's config persistence come from the measured facts supplied with this
     phase, not from a live run here. The stream limits are count-based, not
     CPU-aware.
-19. **No live DVR/go2rtc contact in this phase.** All verification used mock
-    HTTP transports. The real RTSP/go2rtc path is unconfirmed until the Ubuntu
-    test steps above are run.
+19. **No live DVR/go2rtc/CGI contact in this phase.** All verification used mock
+    HTTP transports. The real RTSP/go2rtc path and the real `findFile`/storage
+    paths are unconfirmed until the server test steps above are run.
 20. **Background-tab timer throttling.** Browsers throttle `setInterval` in
     hidden tabs (Chrome can limit it to about once per minute). With the default
     30-second lease, a hidden tab may lose its streams to expiry even though it
@@ -695,10 +942,43 @@ used by this phase.
 25. **`pgrep` and `top` values.** Exact ffmpeg counts and CPU percentages depend
     on the server, go2rtc version, and stream quality; the steps describe the
     expected shape, not measured numbers.
+26. **Real CGI finder behaviour.** The paging loop, `found=<k>` semantics, the
+    100-item boundary, the 30-page truncation, and the `close`/`destroy`
+    responses were tested only with mock transports. Some devices reject
+    `findFile` with `Error / Bad Request!` even though login works; the cause is
+    unknown and is reported as `available: false`.
+27. **Channel offset on other devices.** `RESPONSE_CHANNEL_OFFSET=-1` was
+    measured on one device. Confirm the mapping on each recorder before changing
+    the setting; a wrong value can show an empty day.
+28. **DVR clock and time zones.** Times are treated as naive DVR-local values.
+    Timezone changes, daylight-saving transitions, and a drifting DVR clock are
+    not converted or corrected. The server-date fallback is labelled in the API
+    and UI but may be a different day near midnight.
+29. **Storage info shape.** Health parsing assumes
+    `list.info[N].State=Success` and `list.info[N].Detail[M].IsError=...`.
+    Other firmware may use different keys, return no partitions, or expose a
+    different error flag. `UsedBytes` and `TotalBytes` are intentionally ignored.
+30. **CGI authentication details.** Digest authentication, 401/403 handling, and
+    redirect rejection were tested with mocks only. A device that uses a
+    non-standard login page or redirect may not behave as expected.
+31. **Cache and lock scope.** The finder lock and cache are per process. Running
+    multiple uvicorn workers would give each worker its own lock and cache, so
+    run one worker for this phase.
+32. **Truncation count.** The 3,000-file cap is 30 pages × 100. If a device
+    returns duplicate items or fewer items than `found`, the actual number of
+    usable files can differ.
+33. **Midnight-crossing files.** The parser keeps files that cross the day
+    boundary and clamps coverage/gaps to `00:00:00`-`23:59:59`. Real devices may
+    return different start/end conventions; this was tested with mocks only.
+34. **Unavailable reason text.** The reason is the first response line, capped at
+    60 characters, with URLs and `FilePath` text hidden. The exact wording from
+    other devices is unknown.
+35. **Playback.** The timeline only marks a time. No playback, download, export,
+    or media streaming from recordings exists in this phase.
 
-## Out of scope for Phase 3b
+## Out of scope for Phase 4a
 
-Multiple devices, playback, configuration writes,
+Multiple devices, recording playback or download, configuration writes,
 reboot/factory-reset/format operations, user management, scheduled keepalive,
 recording, PTZ, and authentication or proxying for go2rtc. The go2rtc player is
 reached through the SSH tunnel; a later phase will put it behind authenticated

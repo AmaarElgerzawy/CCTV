@@ -94,6 +94,62 @@
       <div id="live-grid" class="live-grid"></div>
     </section>
 
+    <section class="panel" aria-labelledby="recordings-title">
+      <div class="panel-head">
+        <h2 id="recordings-title">Recordings</h2>
+        <span id="rec-health" class="badge">Storage unknown</span>
+      </div>
+      <div class="recordings-toolbar">
+        <label class="recordings-field" for="rec-channel">
+          Channel
+          <select id="rec-channel"></select>
+        </label>
+        <label class="recordings-field" for="rec-date">
+          Date
+          <input id="rec-date" type="date">
+        </label>
+        <label class="recordings-field" for="rec-stream">
+          Stream
+          <select id="rec-stream">
+            <option value="main" selected>Main</option>
+            <option value="sub">Sub</option>
+          </select>
+        </label>
+        <button id="rec-load" class="button" type="button">Load</button>
+      </div>
+      <p id="rec-status" class="section-note">
+        Choose a date and press Load.
+      </p>
+      <p id="rec-summary" class="section-note" hidden></p>
+      <div id="rec-timeline-wrap" class="recordings-timeline-wrap" hidden>
+        <div
+          id="rec-timeline"
+          class="recordings-timeline"
+          title="Click to mark a time"
+        >
+          <span id="rec-cursor" class="rec-cursor" aria-hidden="true"></span>
+        </div>
+        <div class="recordings-ticks" aria-hidden="true">
+          <span>00</span>
+          <span>03</span>
+          <span>06</span>
+          <span>09</span>
+          <span>12</span>
+          <span>15</span>
+          <span>18</span>
+          <span>21</span>
+          <span>24</span>
+        </div>
+        <p id="rec-selected" class="section-note">
+          Click the timeline to mark a time.
+        </p>
+      </div>
+      <details id="rec-files-details" class="subraw" hidden>
+        <summary>Files</summary>
+        <div id="rec-files" class="table-wrap"></div>
+      </details>
+    </section>
+
     <details class="panel panel-collapse">
       <summary>
         Reported device fields

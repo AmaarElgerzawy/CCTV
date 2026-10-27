@@ -304,6 +304,16 @@ h2 {
   white-space: nowrap;
 }
 
+.badge.ok {
+  color: var(--ok);
+  background: #e7f6ec;
+}
+
+.badge.warn {
+  color: #92400e;
+  background: #fef3c7;
+}
+
 .section-note {
   margin: 0 0 12px;
   color: var(--muted);
@@ -646,6 +656,111 @@ h2 {
   font-size: 12px;
 }
 
+.recordings-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+  margin: 10px 0 14px;
+}
+
+.recordings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.recordings-field select,
+.recordings-field input {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.recordings-field select:focus-visible,
+.recordings-field input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.recordings-toolbar .button {
+  padding: 8px 16px;
+}
+
+.recordings-timeline-wrap {
+  margin: 16px 0 6px;
+}
+
+.recordings-timeline {
+  position: relative;
+  height: 34px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: repeating-linear-gradient(
+    90deg,
+    #eef1f4 0,
+    #eef1f4 1px,
+    #f8fafb 1px,
+    #f8fafb calc(100% / 24)
+  );
+  cursor: crosshair;
+}
+
+.rec-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 2px;
+  background: var(--accent);
+  opacity: 0.78;
+}
+
+.rec-bar:hover {
+  opacity: 1;
+}
+
+.rec-cursor {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 2;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--danger);
+  pointer-events: none;
+}
+
+.recordings-ticks {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.recordings-timeline-wrap > .section-note {
+  margin: 8px 0 0;
+}
+
+.rec-table td {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 880px) {
   .summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -677,6 +792,18 @@ h2 {
   .detail-row {
     grid-template-columns: 1fr;
     gap: 4px;
+  }
+
+  .recordings-toolbar {
+    align-items: stretch;
+  }
+
+  .recordings-field {
+    flex: 1 1 9rem;
+  }
+
+  .recordings-toolbar .button {
+    flex: 1 1 100%;
   }
 }
 

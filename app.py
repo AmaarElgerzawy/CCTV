@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager, contextmanager, suppress
+from datetime import date as date_cls, datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterator
 
@@ -8,6 +10,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from cgi_client import (
+    CgiAuthError,
+    CgiConfigError,
+    CgiError,
+    CgiNetworkError,
+    DvrCgi,
+    day_summary,
+)
 from dvr_client import (
     CONFIG_NAMES,
     DvrAuthError,
@@ -96,7 +106,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 manager.close()
 
 
-app = FastAPI(title="DVR Web", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="DVR Web", version="0.5.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -153,6 +163,54 @@ def _read_device(
         # Log the type only; exception strings can contain upstream data.
         logger.error("Unexpected error while reading DVR data: %s", type(exc).__name__)
         return _error(500, "Unexpected server error.")
+
+
+_DATE_PARAM = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DIGITS = re.compile(r"^[0-9]+$")
+
+
+def _open_cgi() -> DvrCgi:
+    """Create one CGI client. Tests replace this factory."""
+    return DvrCgi.from_env()
+
+
+def _server_clock() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def _device_clock(client: DvrCgi) -> tuple[str, str]:
+    """Return the DVR clock, falling back to the server date and saying so."""
+    try:
+        return await client.get_device_time(), "device"
+    except CgiConfigError:
+        raise
+    except CgiError as exc:
+        logger.warning("DVR clock unavailable: %s", exc)
+        return _server_clock(), "server"
+
+
+def _day_from_clock(value: str) -> date_cls:
+    try:
+        return date_cls.fromisoformat(value[:10])
+    except ValueError:
+        return date_cls.today()
+
+
+def _cgi_error(exc: CgiError) -> JSONResponse:
+    if isinstance(exc, CgiConfigError):
+        logger.error("DVR CGI is not configured: %s", exc)
+        return _error(
+            503,
+            "DVR is not configured. Set DVR_HOST, DVR_USER and DVR_PASS in .env.",
+        )
+    if isinstance(exc, CgiAuthError):
+        logger.warning("DVR CGI authentication was rejected")
+        return _error(502, "The DVR rejected the CGI login.")
+    if isinstance(exc, CgiNetworkError):
+        logger.warning("DVR CGI connection failed: %s", exc)
+        return _error(502, "Could not read from the DVR over CGI.")
+    logger.warning("DVR CGI response was not usable: %s", exc)
+    return _error(503, "The DVR returned an unexpected CGI response.")
 
 
 @app.get("/")
@@ -288,6 +346,116 @@ def close_live(stream_name: str, request: Request) -> JSONResponse:
         return _error(500, "Unexpected server error.")
 
     return JSONResponse({"closed": True})
+
+
+@app.get("/api/recordings/time")
+async def recordings_time() -> JSONResponse:
+    """Return the DVR clock, or the server date when the clock read fails."""
+    try:
+        async with _open_cgi() as client:
+            device_time, source = await _device_clock(client)
+    except CgiError as exc:
+        return _cgi_error(exc)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("Unexpected CGI clock error: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
+    return JSONResponse({"device_time": device_time, "source": source})
+
+
+@app.get("/api/recordings")
+async def recordings(
+    channel: str | None = None,
+    date: str | None = None,
+    stream: str = "main",
+) -> JSONResponse:
+    """Read one channel/stream/day of recordings through the DVR CGI API."""
+    if channel is None or not _DIGITS.fullmatch(channel):
+        return _error(400, "channel must be a channel number.")
+    if date is None or not _DATE_PARAM.fullmatch(date):
+        return _error(400, "date must use YYYY-MM-DD.")
+    try:
+        requested = date_cls.fromisoformat(date)
+    except ValueError:
+        return _error(400, "date is not a valid calendar date.")
+    if stream not in {"main", "sub"}:
+        return _error(400, "stream must be main or sub.")
+
+    number = int(channel)
+    try:
+        max_channel = max_channel_from_env()
+    except StreamConfigError as exc:
+        logger.warning("DVR channel cap is not configured: %s", exc)
+        return _error(503, str(exc))
+    if not 1 <= number <= max_channel:
+        return _error(
+            400, f"channel must be between 1 and {max_channel}."
+        )
+
+    try:
+        async with _open_cgi() as client:
+            device_time, source = await _device_clock(client)
+            device_day = _day_from_clock(device_time)
+            if requested > device_day:
+                return _error(400, "date is later than the DVR date.")
+            if (device_day - requested).days > 90:
+                return _error(
+                    400, "date is more than 90 days before the DVR date."
+                )
+            result = await client.find_files(number, date, stream)
+    except CgiError as exc:
+        return _cgi_error(exc)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("Unexpected CGI recordings error: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
+
+    context = {
+        "device_time": device_time,
+        "device_time_source": source,
+        "date": date,
+        "channel": number,
+        "stream": stream,
+    }
+    if not result["available"]:
+        return JSONResponse(
+            {"available": False, "reason": result["reason"], **context}
+        )
+
+    summary = day_summary(result["files"], requested)
+    return JSONResponse(
+        {
+            "available": True,
+            **context,
+            "files": result["files"],
+            "coverage_seconds": summary["coverage_seconds"],
+            "coverage_percent": summary["coverage_percent"],
+            "last_end": summary["last_end"],
+            "gaps": summary["gaps"],
+            "truncated": bool(result.get("truncated", False)),
+        }
+    )
+
+
+@app.get("/api/storage")
+async def storage() -> JSONResponse:
+    """Return storage health; a failed call is reported as unknown."""
+    try:
+        async with _open_cgi() as client:
+            result = await client.get_storage_health()
+    except CgiConfigError as exc:
+        return _cgi_error(exc)
+    except CgiError as exc:
+        logger.warning("Storage health unavailable: %s", exc)
+        return JSONResponse(
+            {"health": "unknown", "partitions": 0, "errors": 0}
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error(
+            "Unexpected storage-health error: %s", type(exc).__name__
+        )
+        return JSONResponse(
+            {"health": "unknown", "partitions": 0, "errors": 0}
+        )
+    return JSONResponse(result)
 
 
 @app.get("/api/config/{name}")
