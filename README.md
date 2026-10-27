@@ -1,10 +1,11 @@
-# DVR Web — Phase 4a
+# DVR Web — Phase 4b
 
 A small, read-only web app for a Dahua DVR on the local network. It logs in to
 the DVR, reads device identity, video input channels, and selected configuration,
 and shows them in the browser. Phase 3b adds lease-based live streaming through
 go2rtc. Phase 4a adds a read-only recordings list, a 24-hour timeline, and
-storage health through the DVR HTTP CGI API.
+storage health through the DVR HTTP CGI API. Phase 4b adds recorded playback
+through go2rtc from a clip or a timeline time, still read-only on the DVR.
 
 All DVR API behavior is based strictly on [`api_spec.md`](api_spec.md) and the
 current `har_summary.txt`. Points that the sources do not document are marked as
@@ -13,6 +14,7 @@ write methods and never sends a set/write/reboot/format call.
 
 Live video is separate from the DVR JSON-RPC session: the live path uses RTSP
 through go2rtc and does not call `DvrClient` or add any DVR RPC calls.
+Recorded playback also goes through go2rtc with a separate playback RTSP URL.
 Recordings and storage use the DVR HTTP CGI API with Digest authentication and
 do not use the RPC session either. No media is downloaded.
 
@@ -22,9 +24,10 @@ do not use the RPC session either. No media is downloaded.
 | --- | --- |
 | `dvr_client.py` | `DvrClient`: one instance per DVR session; `login()`, `keepalive()`, `get_device_info()`, `get_channels()`, `get_config(name)`, `logout()`, context-manager support |
 | `cgi_client.py` | Read-only DVR CGI client: device clock, `findFile`/`findNextFile` paging, `close`/`destroy` cleanup, storage health, recording cache, and per-device lock |
-| `stream_manager.py` | On-demand go2rtc streams, leases, limits, and cleanup; builds the RTSP URL server-side |
-| `app.py` | FastAPI app: `/`, `/health`, `/api/device/info`, `/api/channels`, `/api/config` (live config), `/api/config/{name}` (DVR config), `/api/live/{channel}/open`, `/api/live/renew`, `/api/live/{stream_name}/close`, `/api/recordings`, `/api/recordings/time`, `/api/storage`, plus the lease reaper |
-| `static/` | Plain HTML/CSS/JS frontend (no build step), including Live and Recordings |
+| `stream_manager.py` | On-demand go2rtc live and recorded-playback streams, leases, limits, and cleanup; builds the RTSP URLs server-side |
+| `app.py` | FastAPI app: `/`, `/health`, `/api/device/info`, `/api/channels`, `/api/config` (live config), `/api/config/{name}` (DVR config), `/api/live/{channel}/open`, `/api/live/renew`, `/api/live/{stream_name}/close`, `/api/playback/open`, `/api/recordings`, `/api/recordings/time`, `/api/storage`, plus the lease reaper |
+| `static/` | Plain HTML/CSS/JS frontend (no build step), including Live, Recordings, and playback |
+| `static/playback_clips.js` | Pure clip-navigation helpers (`daySeconds`, `clipStarts`, `adjacentClipStart`) shared by the browser and a Node test |
 | `test_dvr.py` | Manual login → device/channels/config reads → logout smoke test |
 | `.env.example` | Placeholder configuration to copy to `.env` |
 | `api_spec.md` | DVR API notes this implementation is based on |
@@ -91,6 +94,13 @@ RESPONSE_CHANNEL_OFFSET=-1
 RECORDINGS_CACHE_SECONDS=60
 ```
 
+Phase 4b adds these playback settings:
+
+```dotenv
+MAX_PLAYBACK_STREAMS=2
+PLAYBACK_MAX_SECONDS=3600
+```
+
 - `GO2RTC_URL` is what the backend calls. It should normally stay on loopback.
 - `PUBLIC_GO2RTC_URL` is what the browser uses for the player iframe. Through the
   SSH tunnel it is also `http://127.0.0.1:1984`.
@@ -110,6 +120,11 @@ RECORDINGS_CACHE_SECONDS=60
   measured on one device only.
 - `RECORDINGS_CACHE_SECONDS` is how long one channel/date/stream finder result is
   kept in memory. `0` disables the cache.
+- `MAX_PLAYBACK_STREAMS` is the number of recorded-playback streams allowed at
+  once. Playback has its own counter and does not count against
+  `MAX_LIVE_STREAMS` or `MAX_MAIN_STREAMS`.
+- `PLAYBACK_MAX_SECONDS` is the longest accepted playback request. The browser
+  asks for 600 seconds; the accepted range is 30 to this value.
 
 `DVR_HOST` may include a scheme and port, for example
 `http://192.168.1.100:80`. If no scheme is given, `http://` is used. The RTSP
@@ -191,13 +206,16 @@ will proxy go2rtc behind authentication.
   (`S=1` sub, `S=0` main), URL-encodes the username and password, and sends the
   result only to go2rtc.
 - While any stream is playing, the page sends `POST /api/live/renew` every
-  10 seconds with all playing stream names (including the larger view). The
-  timer stops when nothing is playing and on `pagehide`, which also sends the
-  close beacons.
+  10 seconds with all playing stream names (including the larger view and
+  recorded playback). The timer stops when nothing is playing and on `pagehide`,
+  which also sends the close beacons.
 - If renewal reports a stream as expired, its tile is marked stopped with
-  "Stream expired, press Start". The other tiles are left alone.
+  "Stream expired, press Start". The other tiles are left alone. A playback
+  stream that expires shows "Playback ended".
 - `MAX_LIVE_STREAMS` and `MAX_MAIN_STREAMS` are enforced under a lock. A limit
-  returns HTTP `429` with a clear message.
+  returns HTTP `429` with a clear message. A main-stream limit says
+  "Main-stream limit reached (N). Stop another main stream or switch Grid
+  quality to Sub."
 - A transcoded main stream uses about one CPU core; the server has two. go2rtc
   stops pulling and transcoding when nobody is watching.
 
@@ -211,8 +229,10 @@ a failed delete is logged without a source URL and retried during shutdown
 cleanup. `close` removes the lease, so a closed stream can never expire later.
 
 A name that is unknown or already past its timeout is listed under `expired` by
-the renew endpoint; that is not an HTTP error. The browser turns that into the
-"Stream expired, press Start" state.
+the renew endpoint; that is not an HTTP error. The browser turns a live-stream
+expiry into "Stream expired, press Start" and a playback expiry into
+"Playback ended". Playback streams use the same `cctv-` prefix, lease code, and
+reaper as live streams.
 
 Leases cover a dead tab, a closed browser, or a dropped SSH tunnel without
 relying on the `pagehide` beacon. The app process must still be running for the
@@ -237,7 +257,7 @@ with appropriate permissions; it can contain DVR credentials. Do not commit it
 or paste it into issue reports. Startup cleanup assumes this app is the only
 consumer of the `cctv-` prefix.
 
-## Recordings and storage (Phase 4a)
+## Recordings, playback, and storage (Phases 4a-4b)
 
 The **Recordings** section sits directly after Live. It has a channel select
 (from the reported channel count, capped by `MAX_CHANNEL`), a date input, a
@@ -251,24 +271,65 @@ are read when **Load** is pressed.
 - `Main` maps to the DVR's `VideoStream=Main`; `Sub` maps to `Extra1`.
 - Items are filtered to the requested channel with
   `item.Channel == channel + RESPONSE_CHANNEL_OFFSET`, then sorted by start.
-- The 24-hour timeline draws one plain-CSS bar per file at its position in the
-  day. Empty space is a gap. Clicking the timeline only moves a marker and shows
-  the marked time as text; playback is not implemented.
+- The 24-hour timeline draws one bar per file at its position in the day. Bars
+  are colored by flag: **Event** is amber, **Timing** is the accent color, and
+  other files are gray; a small legend matches the colors. Empty space is a gap.
+- Clicking the timeline marks a time and enables **Play from here**; it does not
+  start playback by itself.
 - Coverage is the merged, day-clamped recording time divided by 86,400
   seconds. Overlapping or adjacent files are merged. Only gaps of 5 minutes or
   more are listed (including a leading or trailing gap when files exist).
 - The summary line shows coverage percent, the last recording end, and the gap
   count. The file table is inside a closed **Files** `<details>`; at most 400
-  rows are rendered, with a note when the backend returned more.
+  rows are rendered, with a note when the backend returned more. Each row has a
+  **Play** button that starts playback at that clip's start.
 - The storage badge shows `ok`, `problem`, or `unknown`. A recorder that
   overwrites old data can report `UsedBytes == TotalBytes`; that is not treated
-  as a problem. `problem` means a partition state other than `Success` or a
+  as a problem. `problem` means a disk state other than `Success` or a
   detail `IsError=true`. A failed storage call is `unknown`.
+- The badge tooltip reports the number of listed disks. The API field is
+  `disks` because it counts `list.info[]` entries, which is what the device
+  reports, not necessarily the number of physical partitions.
 - If the DVR answers `findFile` with `Error / Bad Request!`, the section shows
   "Recordings are unavailable on this device" with that reason. It is not a
   server error.
 - If a finder reaches 30 pages of 100 files (3,000 files), the response is
   marked `truncated` and the section warns that the summary may be incomplete.
+
+### Playback behaviour (Phase 4b)
+
+Playback is available only after recordings for one channel and date are loaded.
+The page knows the loaded channel, the DVR date, and the file list.
+
+- **Play** on a file row plays from that clip's start. A timeline click sets the
+  chosen time and **Play from here** plays from it. **Previous clip** and
+  **Next clip** jump to the previous or next clip start computed from the loaded
+  file list; while playback is active they also start that clip immediately.
+- **Stop** closes the stream, clears the viewer, and shows "Playback ended".
+- One viewer sits under the timeline and uses the public go2rtc player at
+  `stream.html?src=<stream_name>&mode=mse`. The status line reads
+  "Playing from HH:MM:SS. The DVR may start a few seconds earlier and skips gaps
+  between clips."
+- The lease is renewed every 10 seconds through the existing
+  `POST /api/live/renew` batch, together with any live streams. The stream is
+  closed on Stop, when a new playback starts, when the recordings list is
+  reloaded or cleared, and on `pagehide`.
+- If the lease expires, the viewer is cleared and the line shows
+  "Playback ended". There is no pause, speed, or seek control.
+- The backend builds the playback RTSP URL server-side as
+  `rtsp://USER:PASS@HOST:554/cam/playback?channel=N&starttime=YYYY_MM_DD_HH_MM_SS&endtime=YYYY_MM_DD_HH_MM_SS`
+  and sends it only to go2rtc. Times are the DVR's own local clock, the same
+  clock as the recordings list, so no timezone conversion is applied. The
+  measured device may start a few seconds before the requested start, skips
+  gaps between clips, and ends at the end of the last clip.
+- Playback always uses the main stream, even when the clip list was loaded with
+  `Sub`; a note says so. Recordings are H.265, so the go2rtc source is
+  `ffmpeg:<rtsp-url>#video=h264` and the browser plays in MSE mode.
+- `MAX_PLAYBACK_STREAMS` limits playback separately from live streams. A limit
+  returns `429` and the playback status line shows the safe message.
+- TODO(spec): the playback URL's `channel` parameter was confirmed on one device
+  with channel `1` only. The UI passes the 1-based channel number. A playback
+  URL for the `Extra1`/sub stream is not known and is not attempted.
 
 Backend behavior:
 
@@ -323,6 +384,19 @@ and page-error paths, channel-offset filtering, Main/Extra1 separation, coverage
 and gap math across midnight, cache hit/expiry, per-device lock serialization,
 parameter/date validation, `available: false` handling, and the absence of
 credentials and `FilePath` from responses and logs.
+
+Phase 4b was checked the same way with a separate mock-transport suite plus a
+small Node test. The Python suite covered the playback URL (username/password
+quoting, underscore time format, channel, 64/3600/600-second windows, midnight
+rollover, transcode on/off), input validation, the playback-only limit (`429`)
+and its separation from live counters, the main-limit message, lease expiry and
+cleanup of playback names, startup leftover cleanup, safe failures and logs, the
+server-clock fallback, storage `disks`, and regression checks for live and
+recordings. It asserted that no RTSP URL, password, host, or go2rtc response
+appears in a response or log. The Node test covered `daySeconds`, `clipStarts`,
+and `adjacentClipStart`, including previous/next from a clip start, between
+clips, before the first, after the last, empty lists, invalid input, and day
+clamping.
 
 ## Test live view on the Ubuntu server
 
@@ -459,9 +533,10 @@ chat, or issue.
 5. Switch to **Sub**, press **Load**, and repeat the comparison for the
    `Extra1` files.
 
-6. Click the timeline at a few positions. Only the red marker and the marked
-   time text should change; there must be no playback or media download request
-   in the browser network panel.
+6. Click the timeline at a few positions. The red marker and the chosen-time
+   text should change and **Play from here** should become enabled. Clicking the
+   timeline must not start any media request by itself. Colors in the timeline
+   should match the legend: Event, Timing, or Other.
 
 7. Press **Load** again within `RECORDINGS_CACHE_SECONDS` (60 seconds by
    default). The same result should return from the in-memory cache. To compare
@@ -482,6 +557,69 @@ chat, or issue.
 10. With the browser network panel open, inspect the `/api/recordings` JSON.
     Confirm there is no `FilePath` key and no internal DVR path value. Do not
     paste the response body into a report.
+
+## Test playback on the Ubuntu server
+
+Run these after the recordings test, with uvicorn on loopback, the SSH tunnel
+open, and go2rtc already running. Edit `.env` with your own editor. Use stream
+names only in notes; never paste a response body, a go2rtc entry, or `.env`.
+
+1. Keep `MAX_PLAYBACK_STREAMS=2`, `PLAYBACK_MAX_SECONDS=3600`, and the rest of
+   the Phase 4b defaults. Restart uvicorn so the settings are read.
+
+2. Load recordings for one channel and date, open the **Files** details, and
+   press **Play** on a clip. The viewer should appear under the timeline. The
+   status line should read
+   `Playing from HH:MM:SS. The DVR may start a few seconds earlier and skips gaps between clips.`
+   where `HH:MM:SS` is the clip start. Confirm it actually plays video, not a
+   black frame. TODO(spec): use channel 1 for the first test; other channels
+   are not confirmed for the playback URL.
+
+3. In the browser network panel, confirm `POST /api/playback/open` returned only
+   `{"stream_name": "cctv-…"}`. Confirm the response contains no RTSP URL,
+   username, password, DVR host, `FilePath`, or go2rtc response body. Do not
+   copy the stream name into a public report.
+
+4. While it plays, watch the network panel for about 20 seconds. A
+   `POST /api/live/renew` request should include the `cctv-` playback name every
+   10 seconds and report it under `renewed`.
+
+5. Click the timeline at another time and press **Play from here**. The old
+   playback stream should close and a new one should start. Confirm the old
+   `cctv-` name disappears from go2rtc (using names only), for example:
+
+   ```bash
+   curl -s http://127.0.0.1:1984/api/streams | python3 -c "import json,sys; print(' '.join(sorted(json.load(sys.stdin))))"
+   ```
+
+   This prints stream names only. Never print the full go2rtc response, which
+   can contain RTSP credentials.
+
+6. Press **Previous clip** and **Next clip**. Each should choose the adjacent
+   clip start and, while playback is active, restart playback there. The first
+   clip should disable **Previous clip** and the last clip should disable
+   **Next clip**.
+
+7. Press **Stop**. The viewer should clear and the status line should read
+   `Playback ended`. The playback name should disappear from go2rtc within a
+   moment.
+
+8. Start another playback, then close the browser tab without pressing Stop.
+   The `pagehide` beacon should close the stream. If it does not, wait
+   `LEASE_TIMEOUT_SECONDS` (30 seconds by default) and confirm the reaper
+   removed the name. The app must still be running for the reaper to act.
+
+9. Start three playbacks in different tabs or windows (or with the endpoint
+   directly). With `MAX_PLAYBACK_STREAMS=2`, the third should return HTTP `429`
+   with the playback-limit message. Close one and retry; it should succeed.
+   Live streams must still be startable while two playbacks are active, up to
+   their own limits.
+
+10. Review the go2rtc stream list after each step. Only this app's `cctv-`
+    names should be present, and every one should disappear after Stop, expiry,
+    tab close, or server shutdown. If any remain, the shutdown/startup cleanup
+    should remove them on the next start; report the count and whether the
+    cleanup ran, never the stream sources.
 
 ## API
 
@@ -559,6 +697,49 @@ Deletes one stream and removes its lease. The response is `{"closed": true}`. It
 is safe to call twice: an unknown or already-closed name is treated as closed and
 is not forwarded to go2rtc. A malformed name returns `400`; a go2rtc deletion
 failure returns `502`.
+
+### `POST /api/playback/open`
+
+Registers one recorded-playback stream and starts its lease. The body is:
+
+```json
+{
+  "channel": 2,
+  "start": "2026-10-27 11:00:00",
+  "seconds": 600
+}
+```
+
+- `channel` must be between `1` and `MAX_CHANNEL`.
+- `start` must use `YYYY-MM-DD HH:MM:SS`, must be a real date and time, and must
+  not be later than the DVR clock. If the DVR clock cannot be read, the server
+  clock is used and the rejection says so.
+- `seconds` defaults to `600` and must be between `30` and
+  `PLAYBACK_MAX_SECONDS`.
+
+The response contains only the opaque stream name:
+
+```json
+{"stream_name": "cctv-<random>"}
+```
+
+The playback RTSP URL is built server-side and sent only to go2rtc. It is never
+returned or logged. Times are DVR-local and are not timezone-converted.
+Playback uses the main stream. `MAX_PLAYBACK_STREAMS` applies to playback only;
+live counters are unchanged.
+
+Status codes:
+
+- `400` — bad JSON or body shape, channel outside `1..MAX_CHANNEL`, malformed or
+  impossible start, `seconds` outside the allowed range, or a start later than
+  the DVR clock.
+- `429` — `MAX_PLAYBACK_STREAMS` reached.
+- `502` — DVR clock read, network, or go2rtc failure; the message is short and
+  safe.
+- `503` — playback is not configured, or the DVR returned an unusable clock.
+
+TODO(spec): the playback `channel` parameter was confirmed on one device with
+channel `1` only. A sub/extra-stream playback URL is not known.
 
 ### `GET /api/recordings/time`
 
@@ -650,13 +831,16 @@ One finder session runs per DVR host at a time. Results are cached for
 Reads the CGI storage device information and returns only a small health summary:
 
 ```json
-{"health": "ok", "partitions": 2, "errors": 0}
+{"health": "ok", "disks": 4, "errors": 0}
 ```
 
-- `ok` — every reported partition is `State=Success` and no detail
-  `IsError=true`.
-- `problem` — a partition has another state, or a detail reports an error.
-- `unknown` — no partitions were reported or the storage call failed.
+- `ok` — every reported disk is `State=Success` and no detail `IsError=true`.
+- `problem` — a disk has another state, or a detail reports an error.
+- `unknown` — no disks were reported or the storage call failed.
+
+`disks` counts `list.info[]` entries. It was renamed from `partitions` because
+the measured device reports four entries while having four disks; the health
+logic is unchanged.
 
 `UsedBytes == TotalBytes` is deliberately ignored: a recorder that overwrites old
 data can report that with healthy storage. A failed call is still HTTP `200`
@@ -778,8 +962,16 @@ raw DVR payload.
   `FilePath` text hidden; `FilePath` never reaches the browser.
 - `close` and `destroy` always run for a created finder object in a `finally`
   block. The finder is capped at 30 pages; no media is downloaded.
-- The storage endpoint returns only `health`, partition count, and error count.
+- The storage endpoint returns only `health`, disk count, and error count.
   It does not return serial numbers, model strings, or raw storage records.
+- Playback uses the same opaque `cctv-` names and cleanup rules as live. The
+  playback RTSP URL with the requested start/end times and DVR credentials is
+  built server-side and sent only to go2rtc. The browser receives only the
+  stream name. Request times are non-sensitive, but the full URL is still never
+  returned or logged.
+- `/api/playback/open` returns no DVR clock value, file path, or go2rtc
+  response. A failed registration is logged with the exception type and a short
+  safe message.
 - The recordings cache holds file times, types, flags, and sizes only. It is
   in memory, keyed by host/channel/date/stream, and expires after
   `RECORDINGS_CACHE_SECONDS`.
@@ -956,7 +1148,7 @@ used by this phase.
     and UI but may be a different day near midnight.
 29. **Storage info shape.** Health parsing assumes
     `list.info[N].State=Success` and `list.info[N].Detail[M].IsError=...`.
-    Other firmware may use different keys, return no partitions, or expose a
+    Other firmware may use different keys, return no disk entries, or expose a
     different error flag. `UsedBytes` and `TotalBytes` are intentionally ignored.
 30. **CGI authentication details.** Digest authentication, 401/403 handling, and
     redirect rejection were tested with mocks only. A device that uses a
@@ -973,13 +1165,46 @@ used by this phase.
 34. **Unavailable reason text.** The reason is the first response line, capped at
     60 characters, with URLs and `FilePath` text hidden. The exact wording from
     other devices is unknown.
-35. **Playback.** The timeline only marks a time. No playback, download, export,
-    or media streaming from recordings exists in this phase.
+35. **Real playback path.** The playback RTSP URL was measured externally, but
+    this app's URL construction, go2rtc registration, MSE playback, and lease
+    lifecycle were tested only with mock transports and Node here. The server
+    steps above are the real test. In particular, whether go2rtc starts playback
+    at the requested time, how long ffmpeg takes to produce the first frame, and
+    real CPU use for two concurrent playbacks are unconfirmed.
+36. **Playback channel parameter.** Only channel `1` was measured for
+    `/cam/playback`. Other channels are TODO(spec); the UI passes the 1-based
+    channel number unchanged. If playback fails on another channel, test channel
+    1 first before changing code.
+37. **Sub / Extra1 playback.** A playback URL for the sub or extra stream was
+    not measured. Playback always uses the main stream, even when the clip list
+    was loaded with `Sub`, at the cost of more transcoding CPU.
+38. **Playback timing and gaps.** The measured device starts a few seconds
+    before `starttime`, skips gaps between clips, and ends at the last clip end.
+    The exact early-start amount, behavior when `starttime` falls in a large gap,
+    and behavior when the requested window has no recording are unconfirmed.
+    There is no fallback to find the nearest clip server-side.
+39. **Playback end detection.** The app shows "Playback ended" on Stop, lease
+    expiry, or a failed renewal. It does not detect the natural end of the
+    requested window; the iframe may stay open after the DVR has no more video.
+    The browser may show a black frame instead. A long `PLAYBACK_MAX_SECONDS`
+    does not extend the lease.
+40. **Playback navigation while a clip list is truncated.** Previous/next use
+    only the files loaded in the browser (up to 3,000). They cannot cross a day
+    boundary or include files omitted by truncation. The helpers clamp
+    out-of-day times and were tested in Node, not against real DVR data.
+41. **Playback limits and clocks.** `MAX_PLAYBACK_STREAMS` is count-based and
+    independent of CPU. The server-clock fallback compares against the server's
+    naive local time; if the server and DVR are in different time zones, the
+    400 check can reject or accept the wrong request near the clock boundary.
+42. **`disks` count meaning.** The count is the number of `list.info[]` entries,
+    renamed from `partitions` on the measured device. Firmware that reports one
+    entry per volume or per physical disk may show a different number; health is
+    still based on the same state/error fields.
 
-## Out of scope for Phase 4a
+## Out of scope for Phase 4b
 
-Multiple devices, recording playback or download, configuration writes,
+Multiple devices, recording download or export, configuration writes,
 reboot/factory-reset/format operations, user management, scheduled keepalive,
-recording, PTZ, and authentication or proxying for go2rtc. The go2rtc player is
-reached through the SSH tunnel; a later phase will put it behind authenticated
-proxying.
+recording, PTZ, playback pause/speed/seek, and authentication or proxying for
+go2rtc. The go2rtc player is reached through the SSH tunnel; a later phase will
+put it behind authenticated proxying.

@@ -50,6 +50,12 @@ const recCursor = document.getElementById("rec-cursor");
 const recSelected = document.getElementById("rec-selected");
 const recFilesDetails = document.getElementById("rec-files-details");
 const recFiles = document.getElementById("rec-files");
+const recPlayHere = document.getElementById("rec-play-here");
+const recPrevClip = document.getElementById("rec-prev-clip");
+const recNextClip = document.getElementById("rec-next-clip");
+const recStop = document.getElementById("rec-stop");
+const recPlaybackStatus = document.getElementById("rec-playback-status");
+const recPlaybackFrame = document.getElementById("rec-playback-frame");
 
 const CALL_METADATA_KEYS = new Set(["succeeded_calls", "failed_calls"]);
 const MAX_TABLE_ROWS = 400;
@@ -60,6 +66,7 @@ const LIVE_INCLUDE_KEY_PREFIX = "dvr-live-include-";
 const DEFAULT_MAX_CHANNEL = 8;
 const DAY_SECONDS = 86400;
 const MAX_RECORDING_ROWS = 400;
+const PLAYBACK_SECONDS = 600;
 
 const liveState = {
   publicUrl: null,
@@ -75,6 +82,17 @@ const recordingsState = {
   loading: false,
   requestId: 0,
   date: null,
+  channel: null,
+  stream: null,
+  deviceTimeSource: null,
+  files: [],
+};
+
+const playbackState = {
+  name: null,
+  startSeconds: null,
+  selectedSeconds: null,
+  busy: false,
 };
 
 function formatValue(value) {
@@ -562,25 +580,6 @@ function pad2(value) {
   return String(value).padStart(2, "0");
 }
 
-function secondsIntoDay(text, day) {
-  const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(
-    String(text || ""),
-  );
-  if (!match) {
-    return null;
-  }
-  const datePart = `${match[1]}-${match[2]}-${match[3]}`;
-  if (datePart < day) {
-    return 0;
-  }
-  if (datePart > day) {
-    return DAY_SECONDS;
-  }
-  return (
-    Number(match[4]) * 3600 + Number(match[5]) * 60 + Number(match[6])
-  );
-}
-
 function formatDaySeconds(seconds) {
   const value = Math.min(Math.max(0, Math.round(seconds)), DAY_SECONDS - 1);
   return `${pad2(Math.floor(value / 3600))}:${pad2(
@@ -603,7 +602,16 @@ function formatBytes(value) {
 }
 
 function clearRecordings() {
+  const previousPlayback = playbackState.name;
   recordingsState.date = null;
+  recordingsState.channel = null;
+  recordingsState.stream = null;
+  recordingsState.deviceTimeSource = null;
+  recordingsState.files = [];
+  playbackState.name = null;
+  playbackState.startSeconds = null;
+  playbackState.selectedSeconds = null;
+  playbackState.busy = false;
   recSummary.hidden = true;
   recSummary.textContent = "";
   recSummary.className = "section-note";
@@ -611,11 +619,32 @@ function clearRecordings() {
   recFilesDetails.hidden = true;
   recFilesDetails.open = false;
   recFiles.replaceChildren();
+  recPlaybackFrame.replaceChildren();
+  recPlaybackStatus.className = "section-note";
+  recPlaybackStatus.textContent = "Choose a clip or a time to play.";
   for (const bar of recTimeline.querySelectorAll(".rec-bar")) {
     bar.remove();
   }
   recCursor.hidden = true;
   recSelected.textContent = "Click the timeline to mark a time.";
+  updatePlaybackButtons();
+  syncRenewTimer();
+  if (previousPlayback) {
+    sendCloseBeacon(previousPlayback);
+  }
+}
+
+function recBarClass(flags) {
+  const names = Array.isArray(flags)
+    ? flags.map((flag) => String(flag).toLowerCase())
+    : [];
+  if (names.includes("event")) {
+    return "rec-bar rec-bar-event";
+  }
+  if (names.includes("timing")) {
+    return "rec-bar rec-bar-timing";
+  }
+  return "rec-bar rec-bar-other";
 }
 
 function renderTimeline(files, day) {
@@ -624,8 +653,8 @@ function renderTimeline(files, day) {
   }
   const fragment = document.createDocumentFragment();
   for (const file of files) {
-    const start = secondsIntoDay(file?.start, day);
-    const end = secondsIntoDay(file?.end, day);
+    const start = daySeconds(file?.start, day);
+    const end = daySeconds(file?.end, day);
     if (start === null || end === null || end <= start) {
       continue;
     }
@@ -638,7 +667,7 @@ function renderTimeline(files, day) {
       Math.max(0.12, ((end - start) / DAY_SECONDS) * 100),
     );
     const bar = document.createElement("span");
-    bar.className = "rec-bar";
+    bar.className = recBarClass(file?.flags);
     bar.style.left = `${left}%`;
     bar.style.width = `${width}%`;
     bar.title = `${formatValue(file.start)} → ${formatValue(
@@ -661,7 +690,7 @@ function renderRecordingFiles(files) {
   table.className = "config-table rec-table";
   const head = document.createElement("thead");
   const headRow = document.createElement("tr");
-  for (const label of ["Start", "End", "Type", "Flags", "Size"]) {
+  for (const label of ["Start", "End", "Type", "Flags", "Size", "Play"]) {
     const cell = document.createElement("th");
     cell.scope = "col";
     cell.textContent = label;
@@ -686,6 +715,22 @@ function renderRecordingFiles(files) {
       cell.textContent = value;
       row.append(cell);
     }
+
+    const startSeconds = daySeconds(file?.start, recordingsState.date);
+    const playCell = document.createElement("td");
+    const playButton = document.createElement("button");
+    playButton.type = "button";
+    playButton.className = "button button-ghost button-small";
+    playButton.textContent = "Play";
+    playButton.disabled = startSeconds === null;
+    if (startSeconds !== null) {
+      playButton.title = `Play from ${formatDaySeconds(startSeconds)}`;
+      playButton.addEventListener("click", () => {
+        startPlayback(startSeconds);
+      });
+    }
+    playCell.append(playButton);
+    row.append(playCell);
     body.append(row);
   }
   table.append(head, body);
@@ -734,6 +779,19 @@ function renderRecordings(payload, channel, date, stream) {
     typeof payload.last_end === "string" ? payload.last_end : null;
 
   recordingsState.date = date;
+  recordingsState.channel = channel;
+  recordingsState.stream = stream;
+  recordingsState.deviceTimeSource =
+    payload?.device_time_source === "server" ? "server" : "device";
+  const previousPlayback = playbackState.name;
+  recordingsState.files = files;
+  playbackState.name = null;
+  playbackState.startSeconds = null;
+  playbackState.selectedSeconds = null;
+  syncRenewTimer();
+  recPlaybackFrame.replaceChildren();
+  recPlaybackStatus.className = "section-note";
+  recPlaybackStatus.textContent = "Choose a clip or a time to play.";
   renderTimeline(files, date);
   recTimelineWrap.hidden = false;
   recCursor.hidden = true;
@@ -767,6 +825,10 @@ function renderRecordings(payload, channel, date, stream) {
     truncated || sourceNote ? "warn" : files.length > 0 ? "ok" : "warn",
     parts.join(" "),
   );
+  updatePlaybackButtons();
+  if (previousPlayback) {
+    sendCloseBeacon(previousPlayback);
+  }
 }
 
 async function loadRecordings() {
@@ -784,6 +846,10 @@ async function loadRecordings() {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     setSectionNote(recStatus, "error", "Choose a date before loading.");
     return;
+  }
+
+  if (playbackState.name) {
+    await stopPlayback();
   }
 
   recordingsState.loading = true;
@@ -871,8 +937,8 @@ async function loadStorageHealth() {
   recHealth.title = "Reading storage health.";
   try {
     const payload = await fetchJson("/api/storage");
-    const partitions = Number.isInteger(payload?.partitions)
-      ? payload.partitions
+    const disks = Number.isInteger(payload?.disks)
+      ? payload.disks
       : 0;
     const errors = Number.isInteger(payload?.errors) ? payload.errors : 0;
     if (payload?.health === "ok") {
@@ -885,14 +951,55 @@ async function loadStorageHealth() {
       recHealth.className = "badge";
       recHealth.textContent = "Storage unknown";
     }
-    recHealth.title = `${partitions} partition${
-      partitions === 1 ? "" : "s"
+    recHealth.title = `${disks} disk${
+      disks === 1 ? "" : "s"
     }, ${errors} reported error${errors === 1 ? "" : "s"}.`;
   } catch {
     recHealth.className = "badge";
     recHealth.textContent = "Storage unknown";
     recHealth.title = "Storage health could not be read.";
   }
+}
+
+function updatePlaybackButtons() {
+  const ready =
+    Number.isInteger(recordingsState.channel) &&
+    typeof recordingsState.date === "string" &&
+    recordingsState.date !== "" &&
+    Boolean(liveState.publicUrl);
+  const starts = ready
+    ? clipStarts(recordingsState.files, recordingsState.date)
+    : [];
+  const current =
+    playbackState.startSeconds ?? playbackState.selectedSeconds;
+  const previous =
+    current === null
+      ? null
+      : adjacentClipStart(starts, current, "previous");
+  const next = adjacentClipStart(starts, current ?? -1, "next");
+
+  recPlayHere.disabled =
+    !ready ||
+    playbackState.busy ||
+    playbackState.selectedSeconds === null;
+  recPrevClip.disabled =
+    !ready || playbackState.busy || previous === null;
+  recNextClip.disabled = !ready || playbackState.busy || next === null;
+  recStop.disabled = !playbackState.name || playbackState.busy;
+}
+
+function moveCursor(seconds) {
+  recCursor.hidden = false;
+  recCursor.style.left = `${((seconds / DAY_SECONDS) * 100).toFixed(3)}%`;
+}
+
+function setChosenTime(seconds) {
+  playbackState.selectedSeconds = seconds;
+  moveCursor(seconds);
+  recSelected.textContent = `Chosen ${formatDaySeconds(
+    seconds,
+  )} on ${recordingsState.date || recDate.value}. Press Play from here.`;
+  updatePlaybackButtons();
 }
 
 function markTimelineTime(event) {
@@ -908,11 +1015,135 @@ function markTimelineTime(event) {
     DAY_SECONDS - 1,
     Math.round(ratio * DAY_SECONDS),
   );
-  recCursor.hidden = false;
-  recCursor.style.left = `${(ratio * 100).toFixed(3)}%`;
-  recSelected.textContent = `Marked ${formatDaySeconds(
-    seconds,
-  )} on ${recordingsState.date || recDate.value}. Playback comes in a later phase.`;
+  setChosenTime(seconds);
+}
+
+function goToAdjacentClip(direction) {
+  const starts = clipStarts(recordingsState.files, recordingsState.date);
+  const current =
+    playbackState.startSeconds ?? playbackState.selectedSeconds ?? -1;
+  const target = adjacentClipStart(starts, current, direction);
+  if (target === null) {
+    return;
+  }
+  setChosenTime(target);
+  if (playbackState.name) {
+    startPlayback(target);
+  }
+}
+
+async function startPlayback(startSeconds) {
+  if (playbackState.busy) {
+    return;
+  }
+  const channel = recordingsState.channel;
+  const date = recordingsState.date;
+  if (
+    !Number.isInteger(channel) ||
+    typeof date !== "string" ||
+    date === ""
+  ) {
+    recPlaybackStatus.className = "section-note warn";
+    recPlaybackStatus.textContent =
+      "Load recordings for a channel and date first.";
+    return;
+  }
+  if (!liveState.publicUrl) {
+    recPlaybackStatus.className = "section-note error";
+    recPlaybackStatus.textContent = "Live view is not configured.";
+    return;
+  }
+
+  playbackState.busy = true;
+  setChosenTime(startSeconds);
+  updatePlaybackButtons();
+  recPlaybackStatus.className = "section-note loading";
+  recPlaybackStatus.textContent = "Opening playback…";
+
+  const previous = playbackState.name;
+  playbackState.name = null;
+  if (previous) {
+    try {
+      await closeStream(previous);
+    } catch {
+      // The lease reaper will remove it if this close fails.
+    }
+  }
+
+  try {
+    const payload = await fetchJson("/api/playback/open", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        channel,
+        start: `${date} ${formatDaySeconds(startSeconds)}`,
+        seconds: PLAYBACK_SECONDS,
+      }),
+    });
+    const name = payload?.stream_name;
+    if (typeof name !== "string" || name === "") {
+      throw new Error("The server did not return a stream name.");
+    }
+
+    playbackState.name = name;
+    playbackState.startSeconds = startSeconds;
+    recPlaybackFrame.replaceChildren(
+      buildLiveFrame(
+        name,
+        `Playback from ${formatDaySeconds(startSeconds)}`,
+      ),
+    );
+    recPlaybackStatus.className = "section-note ok";
+    recPlaybackStatus.textContent =
+      `Playing from ${formatDaySeconds(startSeconds)}. ` +
+      "The DVR may start a few seconds earlier and skips gaps " +
+      "between clips.";
+    recSelected.textContent = `Playing from ${formatDaySeconds(
+      startSeconds,
+    )} on ${date}.${
+      recordingsState.stream === "sub"
+        ? " Playback uses the main stream."
+        : ""
+    }`;
+    syncRenewTimer();
+  } catch (error) {
+    playbackState.name = null;
+    playbackState.startSeconds = null;
+    recPlaybackFrame.replaceChildren();
+    recPlaybackStatus.className = "section-note error";
+    recPlaybackStatus.textContent =
+      error.message || "Could not start playback.";
+    syncRenewTimer();
+  } finally {
+    playbackState.busy = false;
+    updatePlaybackButtons();
+  }
+}
+
+async function stopPlayback() {
+  const name = playbackState.name;
+  playbackState.name = null;
+  playbackState.startSeconds = null;
+  playbackState.busy = false;
+  recPlaybackFrame.replaceChildren();
+  recPlaybackStatus.className = "section-note";
+  recPlaybackStatus.textContent = "Playback ended";
+  updatePlaybackButtons();
+  syncRenewTimer();
+  if (name) {
+    await closeStream(name).catch(() => {});
+  }
+}
+
+function expirePlayback() {
+  playbackState.name = null;
+  playbackState.startSeconds = null;
+  playbackState.busy = false;
+  recPlaybackFrame.replaceChildren();
+  recPlaybackStatus.className = "section-note warn";
+  recPlaybackStatus.textContent = "Playback ended";
+  updatePlaybackButtons();
+  syncRenewTimer();
 }
 
 function readInclude(channel) {
@@ -1042,6 +1273,22 @@ function playingNames() {
   return names;
 }
 
+function leaseNames() {
+  const names = playingNames();
+  if (playbackState.name) {
+    names.add(playbackState.name);
+  }
+  return names;
+}
+
+function syncRenewTimer() {
+  if (leaseNames().size > 0) {
+    ensureRenewTimer();
+  } else {
+    stopRenewTimer();
+  }
+}
+
 function updateLiveButtons() {
   const busy = liveState.connecting || liveState.disconnecting;
   const anyPlaying = playingNames().size > 0;
@@ -1058,11 +1305,7 @@ function updateLiveButtons() {
   liveDisconnect.disabled = !anyPlaying || busy;
   liveQuality.disabled = busy;
 
-  if (anyPlaying) {
-    ensureRenewTimer();
-  } else {
-    stopRenewTimer();
-  }
+  syncRenewTimer();
 }
 
 function sleep(ms) {
@@ -1193,7 +1436,7 @@ function ensureRenewTimer() {
   if (liveState.renewTimer !== null) {
     return;
   }
-  if (playingNames().size === 0) {
+  if (leaseNames().size === 0) {
     return;
   }
   liveState.renewTimer = window.setInterval(
@@ -1235,7 +1478,7 @@ function markExpired(name) {
 }
 
 async function renewLeases() {
-  const names = [...playingNames()];
+  const names = [...leaseNames()];
   if (names.length === 0) {
     stopRenewTimer();
     return;
@@ -1250,7 +1493,14 @@ async function renewLeases() {
     const expired = Array.isArray(payload?.expired) ? payload.expired : [];
     let expiredCount = 0;
     for (const name of expired) {
-      if (typeof name === "string" && markExpired(name)) {
+      if (typeof name !== "string") {
+        continue;
+      }
+      if (playbackState.name === name) {
+        expirePlayback();
+        continue;
+      }
+      if (markExpired(name)) {
         expiredCount += 1;
       }
     }
@@ -1267,7 +1517,7 @@ async function renewLeases() {
     setSectionNote(
       liveStatus,
       "warn",
-      "Could not renew live streams; retrying.",
+      "Could not renew streams; retrying.",
     );
   } finally {
     updateLiveButtons();
@@ -1448,16 +1698,7 @@ async function closeLarge() {
 
 function closeAllOnUnload() {
   stopRenewTimer();
-  const names = new Set();
-  for (const tile of liveState.tiles.values()) {
-    if (tile.name) {
-      names.add(tile.name);
-    }
-  }
-  if (liveState.large) {
-    names.add(liveState.large.name);
-  }
-  for (const name of names) {
+  for (const name of leaseNames()) {
     sendCloseBeacon(name);
   }
 }
@@ -1494,6 +1735,7 @@ async function loadLiveConfig() {
   syncLiveTiles(null);
   syncRecordingChannels(null);
   updateLiveButtons();
+  updatePlaybackButtons();
 }
 
 async function loadAll() {
@@ -1516,7 +1758,18 @@ liveDisconnect.addEventListener("click", disconnectAll);
 liveLargeClose.addEventListener("click", closeLarge);
 recLoad.addEventListener("click", loadRecordings);
 recTimeline.addEventListener("click", markTimelineTime);
+recPlayHere.addEventListener("click", () => {
+  if (playbackState.selectedSeconds !== null) {
+    startPlayback(playbackState.selectedSeconds);
+  }
+});
+recPrevClip.addEventListener("click", () => goToAdjacentClip("previous"));
+recNextClip.addEventListener("click", () => goToAdjacentClip("next"));
+recStop.addEventListener("click", () => {
+  stopPlayback();
+});
 window.addEventListener("pagehide", closeAllOnUnload);
 syncRecordingChannels(null);
 updateLiveButtons();
+updatePlaybackButtons();
 loadAll();

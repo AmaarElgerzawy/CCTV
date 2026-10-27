@@ -30,6 +30,8 @@ from dvr_client import (
     mask_sensitive,
 )
 from stream_manager import (
+    DEFAULT_PLAYBACK_SECONDS,
+    PLAYBACK_MIN_SECONDS,
     StreamConfigError,
     StreamError,
     StreamLimitError,
@@ -60,7 +62,7 @@ async def _lease_reaper(manager: StreamManager) -> None:
             continue
         if expired:
             logger.info(
-                "Live stream lease expired: %s", ", ".join(expired)
+                "Stream lease expired: %s", ", ".join(expired)
             )
 
 
@@ -106,7 +108,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 manager.close()
 
 
-app = FastAPI(title="DVR Web", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="DVR Web", version="0.6.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -166,6 +168,7 @@ def _read_device(
 
 
 _DATE_PARAM = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_START_PARAM = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 _DIGITS = re.compile(r"^[0-9]+$")
 
 
@@ -348,6 +351,85 @@ def close_live(stream_name: str, request: Request) -> JSONResponse:
     return JSONResponse({"closed": True})
 
 
+@app.post("/api/playback/open")
+async def open_playback(request: Request) -> JSONResponse:
+    """Register one read-only recorded-playback stream by its start time."""
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "Body must be a JSON object.")
+
+    if not isinstance(body, dict):
+        return _error(400, "Body must be a JSON object.")
+
+    channel = body.get("channel")
+    start = body.get("start")
+    seconds = body.get("seconds", DEFAULT_PLAYBACK_SECONDS)
+
+    if not isinstance(channel, int) or isinstance(channel, bool):
+        return _error(400, "channel must be a channel number.")
+    if not isinstance(start, str) or not _START_PARAM.fullmatch(start):
+        return _error(400, "start must use YYYY-MM-DD HH:MM:SS.")
+    try:
+        start_time = datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return _error(400, "start is not a valid date and time.")
+    if not isinstance(seconds, int) or isinstance(seconds, bool):
+        return _error(400, "seconds must be a whole number.")
+
+    try:
+        manager = _live_manager(request)
+    except StreamConfigError as exc:
+        logger.warning("Playback is not configured: %s", exc)
+        return _error(503, str(exc))
+
+    if not 1 <= channel <= manager.max_channel:
+        return _error(
+            400, f"Channel must be between 1 and {manager.max_channel}."
+        )
+    if not PLAYBACK_MIN_SECONDS <= seconds <= manager.max_playback_seconds:
+        return _error(
+            400,
+            f"seconds must be between {PLAYBACK_MIN_SECONDS} and "
+            f"{manager.max_playback_seconds}.",
+        )
+
+    try:
+        async with _open_cgi() as client:
+            device_time, source = await _device_clock(client)
+    except CgiError as exc:
+        return _cgi_error(exc)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("Unexpected CGI clock error: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
+
+    try:
+        device_now = datetime.strptime(device_time, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return _error(503, "The DVR returned an unusable clock.")
+    if start_time > device_now:
+        note = " (server clock used)" if source == "server" else ""
+        return _error(400, f"start is later than the DVR time{note}.")
+
+    try:
+        stream_name = await asyncio.to_thread(
+            manager.open_playback, channel, start_time, seconds
+        )
+    except StreamLimitError as exc:
+        return _error(429, str(exc))
+    except StreamConfigError as exc:
+        logger.warning("Playback is not configured: %s", exc)
+        return _error(503, str(exc))
+    except StreamError as exc:
+        logger.warning("Playback stream registration failed: %s", exc)
+        return _error(502, "Could not start playback.")
+    except Exception as exc:  # defensive: never expose an upstream response
+        logger.error("Unexpected playback error: %s", type(exc).__name__)
+        return _error(500, "Unexpected server error.")
+
+    return JSONResponse({"stream_name": stream_name})
+
+
 @app.get("/api/recordings/time")
 async def recordings_time() -> JSONResponse:
     """Return the DVR clock, or the server date when the clock read fails."""
@@ -446,14 +528,14 @@ async def storage() -> JSONResponse:
     except CgiError as exc:
         logger.warning("Storage health unavailable: %s", exc)
         return JSONResponse(
-            {"health": "unknown", "partitions": 0, "errors": 0}
+            {"health": "unknown", "disks": 0, "errors": 0}
         )
     except Exception as exc:  # pragma: no cover - defensive
         logger.error(
             "Unexpected storage-health error: %s", type(exc).__name__
         )
         return JSONResponse(
-            {"health": "unknown", "partitions": 0, "errors": 0}
+            {"health": "unknown", "disks": 0, "errors": 0}
         )
     return JSONResponse(result)
 

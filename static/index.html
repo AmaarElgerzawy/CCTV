@@ -140,9 +140,77 @@
           <span>21</span>
           <span>24</span>
         </div>
+        <div class="rec-legend">
+          <span class="rec-legend-item">
+            <span
+              class="rec-swatch rec-swatch-timing"
+              aria-hidden="true"
+            ></span>
+            Timing
+          </span>
+          <span class="rec-legend-item">
+            <span
+              class="rec-swatch rec-swatch-event"
+              aria-hidden="true"
+            ></span>
+            Event
+          </span>
+          <span class="rec-legend-item">
+            <span
+              class="rec-swatch rec-swatch-other"
+              aria-hidden="true"
+            ></span>
+            Other
+          </span>
+        </div>
         <p id="rec-selected" class="section-note">
           Click the timeline to mark a time.
         </p>
+        <div id="rec-playback" class="playback">
+          <div class="playback-controls">
+            <button
+              id="rec-play-here"
+              class="button button-small"
+              type="button"
+              disabled
+            >
+              Play from here
+            </button>
+            <button
+              id="rec-prev-clip"
+              class="button button-ghost button-small"
+              type="button"
+              disabled
+            >
+              Previous clip
+            </button>
+            <button
+              id="rec-next-clip"
+              class="button button-ghost button-small"
+              type="button"
+              disabled
+            >
+              Next clip
+            </button>
+            <button
+              id="rec-stop"
+              class="button button-ghost button-small"
+              type="button"
+              disabled
+            >
+              Stop
+            </button>
+          </div>
+          <p
+            id="rec-playback-status"
+            class="section-note"
+            role="status"
+            aria-live="polite"
+          >
+            Choose a clip or a time to play.
+          </p>
+          <div id="rec-playback-frame" class="live-frame playback-frame"></div>
+        </div>
       </div>
       <details id="rec-files-details" class="subraw" hidden>
         <summary>Files</summary>
@@ -215,6 +283,7 @@
     </footer>
   </main>
 
+  <script src="/static/playback_clips.js" defer></script>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

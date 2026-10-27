@@ -728,6 +728,18 @@ h2 {
   opacity: 0.78;
 }
 
+.rec-bar-timing {
+  background: var(--accent);
+}
+
+.rec-bar-event {
+  background: #b45309;
+}
+
+.rec-bar-other {
+  background: #64748b;
+}
+
 .rec-bar:hover {
   opacity: 1;
 }
@@ -750,6 +762,56 @@ h2 {
   color: var(--muted);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+}
+
+.rec-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.rec-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.rec-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.rec-swatch-timing {
+  background: var(--accent);
+}
+
+.rec-swatch-event {
+  background: #b45309;
+}
+
+.rec-swatch-other {
+  background: #64748b;
+}
+
+.playback-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 0;
+}
+
+.playback-frame {
+  max-width: 640px;
+  margin-top: 10px;
+}
+
+.playback-frame:empty {
+  display: none;
 }
 
 .recordings-timeline-wrap > .section-note {

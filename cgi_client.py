@@ -489,7 +489,7 @@ class DvrCgi:
             )
         except CgiError as exc:
             logger.warning("DVR storage health unavailable: %s", exc)
-            return {"health": "unknown", "partitions": 0, "errors": 0}
+            return {"health": "unknown", "disks": 0, "errors": 0}
 
         indices = {int(match.group(1)) for match in _PARTITION_RE.finditer(text)}
         states = {
@@ -509,7 +509,7 @@ class DvrCgi:
             health = "ok" if all_success and errors == 0 else "problem"
         return {
             "health": health,
-            "partitions": len(indices),
+            "disks": len(indices),
             "errors": errors,
         }
 

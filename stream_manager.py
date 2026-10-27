@@ -1,4 +1,4 @@
-"""On-demand go2rtc stream registration for the DVR live view.
+"""On-demand go2rtc stream registration for the DVR live view and playback.
 
 The backend owns the RTSP URL and never returns or logs it. The browser only
 receives an opaque go2rtc stream name.
@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
@@ -31,9 +32,14 @@ DEFAULT_PUBLIC_GO2RTC_URL = "http://127.0.0.1:1984"
 DEFAULT_MAX_CHANNEL = 8
 DEFAULT_MAX_LIVE_STREAMS = 6
 DEFAULT_MAX_MAIN_STREAMS = 2
+DEFAULT_MAX_PLAYBACK_STREAMS = 2
+DEFAULT_PLAYBACK_MAX_SECONDS = 3600
+DEFAULT_PLAYBACK_SECONDS = 600
+PLAYBACK_MIN_SECONDS = 30
 DEFAULT_LEASE_TIMEOUT_SECONDS = 30.0
 DEFAULT_LEASE_CHECK_INTERVAL_SECONDS = 5.0
 _RTSP_PORT = 554
+_PLAYBACK_TIME_FORMAT = "%Y_%m_%d_%H_%M_%S"
 _STREAM_NAME = re.compile(r"^cctv-[A-Za-z0-9_-]{8,64}$")
 
 
@@ -54,6 +60,7 @@ class ActiveStream:
     channel: int
     quality: str
     last_renewed: float
+    kind: str = "live"
 
 
 def is_stream_name(name: str) -> bool:
@@ -149,6 +156,8 @@ class StreamManager:
         max_channel: int = DEFAULT_MAX_CHANNEL,
         max_live_streams: int = DEFAULT_MAX_LIVE_STREAMS,
         max_main_streams: int = DEFAULT_MAX_MAIN_STREAMS,
+        max_playback_streams: int = DEFAULT_MAX_PLAYBACK_STREAMS,
+        playback_max_seconds: int = DEFAULT_PLAYBACK_MAX_SECONDS,
         lease_timeout: float = DEFAULT_LEASE_TIMEOUT_SECONDS,
         lease_check_interval: float = DEFAULT_LEASE_CHECK_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -159,6 +168,14 @@ class StreamManager:
             raise StreamConfigError("MAX_CHANNEL must be a positive integer")
         if max_live_streams < 1 or max_main_streams < 1:
             raise StreamConfigError("Stream limits must be positive integers")
+        if max_playback_streams < 1:
+            raise StreamConfigError(
+                "MAX_PLAYBACK_STREAMS must be a positive integer"
+            )
+        if playback_max_seconds < PLAYBACK_MIN_SECONDS:
+            raise StreamConfigError(
+                f"PLAYBACK_MAX_SECONDS must be at least {PLAYBACK_MIN_SECONDS}"
+            )
         if lease_timeout <= 0 or lease_check_interval <= 0:
             raise StreamConfigError("Lease settings must be positive numbers")
         self._dvr_host = _dvr_hostname(dvr_host)
@@ -168,6 +185,8 @@ class StreamManager:
         self._max_channel = max_channel
         self._max_live_streams = max_live_streams
         self._max_main_streams = max_main_streams
+        self._max_playback_streams = max_playback_streams
+        self._playback_max_seconds = playback_max_seconds
         self._lease_timeout = lease_timeout
         self._lease_check_interval = lease_check_interval
         self._clock = clock
@@ -210,6 +229,12 @@ class StreamManager:
             max_main_streams=_env_positive_int(
                 "MAX_MAIN_STREAMS", DEFAULT_MAX_MAIN_STREAMS
             ),
+            max_playback_streams=_env_positive_int(
+                "MAX_PLAYBACK_STREAMS", DEFAULT_MAX_PLAYBACK_STREAMS
+            ),
+            playback_max_seconds=_env_positive_int(
+                "PLAYBACK_MAX_SECONDS", DEFAULT_PLAYBACK_MAX_SECONDS
+            ),
             lease_timeout=_env_positive_float(
                 "LEASE_TIMEOUT_SECONDS", DEFAULT_LEASE_TIMEOUT_SECONDS
             ),
@@ -229,15 +254,32 @@ class StreamManager:
         return self._lease_check_interval
 
     @property
+    def max_playback_seconds(self) -> int:
+        return self._playback_max_seconds
+
+    @property
     def active_count(self) -> int:
         with self._lock:
-            return len(self._active)
+            return sum(
+                1 for stream in self._active.values() if stream.kind == "live"
+            )
 
     @property
     def active_main_count(self) -> int:
         with self._lock:
             return sum(
-                1 for stream in self._active.values() if stream.quality == "main"
+                1
+                for stream in self._active.values()
+                if stream.kind == "live" and stream.quality == "main"
+            )
+
+    @property
+    def active_playback_count(self) -> int:
+        with self._lock:
+            return sum(
+                1
+                for stream in self._active.values()
+                if stream.kind == "playback"
             )
 
     def open(self, channel: int, quality: str = "sub") -> str:
@@ -255,7 +297,12 @@ class StreamManager:
 
         name = f"{STREAM_PREFIX}{uuid.uuid4().hex}"
         with self._lock:
-            if len(self._active) >= self._max_live_streams:
+            live_count = sum(
+                1
+                for stream in self._active.values()
+                if stream.kind == "live"
+            )
+            if live_count >= self._max_live_streams:
                 raise StreamLimitError(
                     f"Live stream limit reached ({self._max_live_streams}). "
                     "Stop a stream and try again."
@@ -263,12 +310,12 @@ class StreamManager:
             main_count = sum(
                 1
                 for stream in self._active.values()
-                if stream.quality == "main"
+                if stream.kind == "live" and stream.quality == "main"
             )
             if quality == "main" and main_count >= self._max_main_streams:
                 raise StreamLimitError(
                     f"Main-stream limit reached ({self._max_main_streams}). "
-                    "Close the larger view and try again."
+                    "Stop another main stream or switch Grid quality to Sub."
                 )
             self._active[name] = ActiveStream(
                 channel=channel,
@@ -279,6 +326,56 @@ class StreamManager:
 
         try:
             self._register(name, self._build_source(channel, quality))
+        except Exception:
+            with self._lock:
+                self._active.pop(name, None)
+                self._created.discard(name)
+            raise
+        return name
+
+    def open_playback(
+        self, channel: int, start: datetime, seconds: int
+    ) -> str:
+        """Register one recorded-playback stream and return its name.
+
+        TODO(spec): the playback URL's channel parameter was confirmed on one
+        device with channel 1 only. The UI keeps the 1-based channel number.
+        """
+        if not 1 <= channel <= self._max_channel:
+            raise StreamConfigError(
+                f"channel must be between 1 and {self._max_channel}"
+            )
+        if not PLAYBACK_MIN_SECONDS <= seconds <= self._playback_max_seconds:
+            raise StreamConfigError(
+                f"seconds must be between {PLAYBACK_MIN_SECONDS} and "
+                f"{self._playback_max_seconds}"
+            )
+
+        name = f"{STREAM_PREFIX}{uuid.uuid4().hex}"
+        with self._lock:
+            playback_count = sum(
+                1
+                for stream in self._active.values()
+                if stream.kind == "playback"
+            )
+            if playback_count >= self._max_playback_streams:
+                raise StreamLimitError(
+                    "Playback-stream limit reached "
+                    f"({self._max_playback_streams}). "
+                    "Stop a playback and try again."
+                )
+            self._active[name] = ActiveStream(
+                channel=channel,
+                quality="main",
+                last_renewed=self._clock(),
+                kind="playback",
+            )
+            self._created.add(name)
+
+        try:
+            self._register(
+                name, self._build_playback_source(channel, start, seconds)
+            )
         except Exception:
             with self._lock:
                 self._active.pop(name, None)
@@ -426,6 +523,28 @@ class StreamManager:
         rtsp_url = (
             f"rtsp://{user}:{password}@{self._dvr_host}:{_RTSP_PORT}"
             f"/cam/realmonitor?channel={channel}&subtype={subtype}"
+        )
+        if self._transcode_h264:
+            return f"ffmpeg:{rtsp_url}#video=h264"
+        return rtsp_url
+
+    def _build_playback_source(
+        self, channel: int, start: datetime, seconds: int
+    ) -> str:
+        """Build the recorded-playback RTSP source, never logged or returned.
+
+        Times use the DVR's own local clock, exactly like the recordings list,
+        so no timezone conversion is applied.
+        """
+        user = quote(self._dvr_user, safe="")
+        password = quote(self._dvr_pass, safe="")
+        end = start + timedelta(seconds=seconds)
+        start_text = start.strftime(_PLAYBACK_TIME_FORMAT)
+        end_text = end.strftime(_PLAYBACK_TIME_FORMAT)
+        rtsp_url = (
+            f"rtsp://{user}:{password}@{self._dvr_host}:{_RTSP_PORT}"
+            f"/cam/playback?channel={channel}"
+            f"&starttime={start_text}&endtime={end_text}"
         )
         if self._transcode_h264:
             return f"ffmpeg:{rtsp_url}#video=h264"
