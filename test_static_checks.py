@@ -23,8 +23,17 @@ class StaticChecks(unittest.TestCase):
         )
         combined = (result.stdout or "") + "\n" + (result.stderr or "")
         for line in combined.splitlines():
+            if not line.strip():
+                continue
             if "undefined name" in line.lower():
                 self.fail(f"pyflakes found undefined name: {line}")
+            # Allow only unused imports/variables
+            if "imported but unused" in line.lower():
+                continue
+            if "assigned to but never used" in line.lower():
+                continue
+            # Any other message is a failure
+            self.fail(f"pyflakes reported disallowed issue: {line}")
 
 
 if __name__ == "__main__":

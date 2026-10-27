@@ -183,7 +183,7 @@ def clear_cache() -> None:
 _LOCKS_GUARD = threading.Lock()
 
 _FIND_LOCKS: dict[tuple[str, int], asyncio.Lock] = {}
-_FIND_LOCKS_GUARD = asyncio.Lock()
+_FIND_LOCKS_GUARD = threading.Lock()
 
 _CACHE: dict[tuple[object, ...], tuple[float, dict[str, Any]]] = {}
 _CACHE_GUARD = threading.Lock()
@@ -198,7 +198,6 @@ def _cache_get(key: tuple[object, ...], now: float) -> dict[str, Any] | None:
         if expires < now:
             _CACHE.pop(key, None)
             return None
-        # Return a shallow copy to avoid mutation
         return dict(value)
 
 
@@ -207,9 +206,9 @@ def _cache_put(key: tuple[object, ...], value: dict[str, Any], expires: float) -
         _CACHE[key] = (expires, dict(value))
 
 
-async def _device_lock(host: str, port: int) -> asyncio.Lock:
+def _device_lock(host: str, port: int) -> asyncio.Lock:
     key = (host, int(port))
-    async with _FIND_LOCKS_GUARD:
+    with _FIND_LOCKS_GUARD:
         lock = _FIND_LOCKS.get(key)
         if lock is None:
             lock = asyncio.Lock()

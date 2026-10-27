@@ -1802,6 +1802,14 @@ Phase 5a registry:
     state. Running multiple uvicorn workers would run duplicate rounds and could
     race on SQLite writes; use one worker in this phase.
 
+## Testing
+
+- Unit/static checks: `python -W error::RuntimeWarning -m unittest discover -p "test_*.py"`
+- Pyflakes (all .py): `python -m pyflakes *.py` (or use test_static_checks)
+- JS syntax: `node -c static/app.js && node -c static/devices.js && node -c static/device_selector.js`
+- JS unit: `node test_device_selector.js`
+- Dev deps: `pip install -r requirements-dev.txt`
+
 ## Out of scope for Phase 5a
 
 Linking a registry device to Live, Recordings, or Settings; per-device
