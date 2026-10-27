@@ -1,11 +1,17 @@
-# DVR Web — Phase 4b
+# DVR Web — Phase 5a
 
-A small, read-only web app for a Dahua DVR on the local network. It logs in to
-the DVR, reads device identity, video input channels, and selected configuration,
+A small, read-only web app for Dahua DVRs on the local network. It logs in to
+a DVR, reads device identity, video input channels, and selected configuration,
 and shows them in the browser. Phase 3b adds lease-based live streaming through
 go2rtc. Phase 4a adds a read-only recordings list, a 24-hour timeline, and
 storage health through the DVR HTTP CGI API. Phase 4b adds recorded playback
 through go2rtc from a clip or a timeline time, still read-only on the DVR.
+Phase 5a adds a local device registry: groups, up to hundreds of recorders,
+encrypted per-device credentials with a default fallback, CSV import, and a
+TCP-only online-status checker.
+
+The Live, Recordings, and Settings pages still use `DVR_HOST`/`DVR_USER`/
+`DVR_PASS`. Linking them to a selected registry device is the next phase.
 
 All DVR API behavior is based strictly on [`api_spec.md`](api_spec.md) and the
 current `har_summary.txt`. Points that the sources do not document are marked as
@@ -25,10 +31,13 @@ do not use the RPC session either. No media is downloaded.
 | `dvr_client.py` | `DvrClient`: one instance per DVR session; `login()`, `keepalive()`, `get_device_info()`, `get_channels()`, `get_config(name)`, `logout()`, context-manager support |
 | `cgi_client.py` | Read-only DVR CGI client: device clock, `findFile`/`findNextFile` paging, `close`/`destroy` cleanup, storage health, recording cache, and per-device lock |
 | `stream_manager.py` | On-demand go2rtc live and recorded-playback streams, leases, limits, and cleanup; builds the RTSP URLs server-side |
-| `app.py` | FastAPI app: `/`, `/health`, `/api/device/info`, `/api/channels`, `/api/config` (live config), `/api/config/{name}` (DVR config), `/api/live/{channel}/open`, `/api/live/renew`, `/api/live/{stream_name}/close`, `/api/playback/open`, `/api/recordings`, `/api/recordings/time`, `/api/storage`, plus the lease reaper |
-| `static/` | Plain HTML/CSS/JS frontend (no build step), including Live, Recordings, and playback |
+| `registry.py` | Phase 5a device registry: settings, SQLite storage, Fernet credentials, groups/devices, CSV import, first-run migration, connection test, and the TCP status checker |
+| `app.py` | FastAPI app: `/`, `/devices`, `/health`, `/api/device/info`, `/api/channels`, `/api/config` (live config), `/api/config/{name}` (DVR config), `/api/live/{channel}/open`, `/api/live/renew`, `/api/live/{stream_name}/close`, `/api/playback/open`, `/api/recordings`, `/api/recordings/time`, `/api/storage`, the registry API, plus the lease reaper and status checker |
+| `static/` | Plain HTML/CSS/JS frontend (no build step), including Live, Recordings, playback, and the Devices page |
 | `static/playback_clips.js` | Pure clip-navigation helpers (`daySeconds`, `clipStarts`, `adjacentClipStart`) shared by the browser and a Node test |
+| `static/devices.html`, `static/devices.js` | Phase 5a registry page: counters, search/state filter, grouped devices, CRUD, default credentials, CSV preview/import, status refresh |
 | `test_dvr.py` | Manual login → device/channels/config reads → logout smoke test |
+| `test_registry.py` | Offline unittest suite for Phase 5a (mock transports, fake sockets, temp SQLite) |
 | `.env.example` | Placeholder configuration to copy to `.env` |
 | `api_spec.md` | DVR API notes this implementation is based on |
 
@@ -125,6 +134,51 @@ PLAYBACK_MAX_SECONDS=3600
   `MAX_LIVE_STREAMS` or `MAX_MAIN_STREAMS`.
 - `PLAYBACK_MAX_SECONDS` is the longest accepted playback request. The browser
   asks for 600 seconds; the accepted range is 30 to this value.
+
+Phase 5a adds these registry settings:
+
+```dotenv
+APP_SECRET_KEY=replace-with-a-generated-fernet-key
+DATA_DIR=./data
+STATUS_INTERVAL_SECONDS=60
+STATUS_CONCURRENCY=10
+STATUS_TIMEOUT_SECONDS=2
+ALLOW_PUBLIC_HOSTS=false
+```
+
+Generate the Fernet key once, then paste only the value:
+
+```powershell
+python -c "from cryptography.fernet import Fernet as F; print(F.generate_key().decode())"
+```
+
+```bash
+python3 -c "from cryptography.fernet import Fernet as F; print(F.generate_key().decode())"
+```
+
+- `APP_SECRET_KEY` encrypts the stored DVR passwords. If it is missing or not a
+  valid Fernet key, every registry endpoint returns `503` with
+  "Device registry is not configured. Set a valid APP_SECRET_KEY in .env." and
+  the rest of the app (Live, Recordings, Settings) keeps working. Changing the key
+  makes the stored passwords unreadable; they must be entered again.
+- `DATA_DIR` holds `dvr.db`. A relative path is resolved from the app folder,
+  so `./data` is `<repo>/data/dvr.db`. On first use the directory and the SQLite
+  file are created; on POSIX the file is chmod `600` (best effort, ignored on
+  Windows). `data/` is in `.gitignore`; never commit or paste the database.
+- `STATUS_INTERVAL_SECONDS` is the delay between background status rounds
+  (default `60`). Invalid or non-positive values fall back to the default.
+- `STATUS_CONCURRENCY` is the maximum number of devices checked at once
+  (default `10`). Each device uses at most one socket at a time.
+- `STATUS_TIMEOUT_SECONDS` is the per-port TCP connect timeout (default `2`).
+- `ALLOW_PUBLIC_HOSTS=false` rejects public IP literals as device hosts. Set it
+  to `true` only if the registry really contains recorders reachable over the
+  internet.
+- `cryptography` is installed from `requirements.txt` and is only used for the
+  registry's credential encryption.
+
+No registry password can be read back: the API returns only
+`has_own_credentials` / `has_password`, and no response, log line, error message,
+CSV result, or export contains one.
 
 `DVR_HOST` may include a scheme and port, for example
 `http://192.168.1.100:80`. If no scheme is given, `http://` is used. The RTSP
@@ -349,6 +403,133 @@ Backend behavior:
   returned, rendered, logged, or included in an error.
 - Read-only: this phase never calls a set/write/delete/format/reboot/download
   action and never downloads media.
+
+## Device registry (Phase 5a)
+
+The registry is a local inventory of recorders. It is independent of the
+single-device `DVR_*` settings: Live, Recordings, and Settings still use those,
+and the registry never changes them.
+
+**Binding requirement.** The app has no user login. Until an authentication
+phase exists, bind uvicorn to `127.0.0.1` only (the examples in this file do).
+Anyone who can reach the port can read device names/hosts, change the registry,
+and trigger a connection test with the stored credentials. Do not bind to
+`0.0.0.0`, do not reverse-proxy it, and do not expose it through a public SSH
+tunnel. The `/devices` page is served at `/static/devices.html` as well.
+
+### Storage
+
+- SQLite at `DATA_DIR/dvr.db`, opened with `sqlite3` from `asyncio.to_thread`,
+  foreign keys on, one short transaction per operation.
+- `groups(id, name UNIQUE COLLATE NOCASE)`. Groups are flat; there is no nesting.
+- `devices(id, name UNIQUE COLLATE NOCASE, group_id, host, http_port,
+  rtsp_port, username, password_enc, notes, created_at, last_seen)`.
+  `group_id` is optional; deleting a group moves its devices to "No group"
+  (`ON DELETE SET NULL`).
+- `settings(key, value)`: the default username in clear text, the default
+  password encrypted, and the first-run migration marker.
+- A unique `(host, http_port)` index rejects the same web endpoint twice. Two
+  devices may share a host with different HTTP ports.
+- `last_seen` is an ISO-8601 UTC timestamp, persisted whenever at least one of
+  the two ports answered. An offline round does not clear it.
+
+### Credentials
+
+- One default username/password pair plus an optional per-device override. A
+  device with no username uses the default; an override always wins.
+- Overrides are written together: a username requires a password and a password
+  requires a username. On update, omitting both keeps the current override, and
+  sending `""` for both removes it (the device falls back to the defaults).
+- Passwords are encrypted with Fernet (`APP_SECRET_KEY`) before they reach the
+  database. The default username is stored in clear text, as specified.
+- Passwords are write-only. The API returns `has_own_credentials` and
+  `has_password` only. No password appears in a response, a log line, an error
+  message, a CSV result, or an export.
+- If a stored value cannot be decrypted (for example after changing
+  `APP_SECRET_KEY`), the device falls back to the defaults and a warning is
+  logged without the ciphertext or the key.
+
+### Validation
+
+- Names (device and group): 1–64 characters, no control characters,
+  case-insensitive uniqueness.
+- Host: a hostname or IPv4 literal. An IPv4 literal must be private, loopback,
+  or link-local unless `ALLOW_PUBLIC_HOSTS=true`. Public literals such as
+  `8.8.8.8` are rejected. A hostname is accepted as written (lowercased) and is
+  not resolved at validation time.
+- Ports: integers `1`–`65535`; the defaults are HTTP `80` and RTSP `554`.
+- Notes: up to 1,000 characters; username: up to 64; password: up to 512.
+- Duplicate `(host, http_port)` and duplicate names are rejected with `409`.
+
+### CSV import
+
+Header row required, case-insensitive, exactly these columns (order free):
+
+```csv
+name,group,host,http_port,rtsp_port,username,password
+Lobby 1,Floor 1,192.168.1.50,80,554,,
+Roof,Floor 2,192.168.1.51,8080,10554,admin,override-password
+```
+
+- Only `name` and `host` are required. Empty ports use the defaults. `group` is
+  created when missing. Empty username and password mean "use the defaults".
+- Limits: 500 data rows and 256 KB of UTF-8. Header problems and limit
+  violations reject the whole request with `400`; a bad data row is reported as
+  a row result.
+- `dry_run=true` (the default) validates and returns per-row
+  `{row, status: "ok"|"error"|"duplicate", message}` plus
+  `counts.rows/ok/error/duplicate/imported`, and writes nothing. `row` is the
+  CSV line number, so the header is line 1.
+- `dry_run=false` validates first and writes only the valid rows in one
+  transaction, creating missing groups. Invalid and duplicate rows are skipped.
+- A password in the CSV is encrypted immediately and never echoed back, not
+  even in a row message.
+
+### Online status
+
+- A background `asyncio` task runs one round immediately at startup and then
+  every `STATUS_INTERVAL_SECONDS`; it is cancelled on shutdown.
+- A round opens a plain TCP connection to the HTTP port and then to the RTSP
+  port with `STATUS_TIMEOUT_SECONDS`, at most `STATUS_CONCURRENCY` devices at a
+  time. It sends no HTTP request, performs no login, and reads no DVR data.
+- State: `online` when both ports answer, `partial` when one does, `offline`
+  when neither does, and `unknown` until the first round. `last_seen` is the last
+  time a port answered (persisted); `last_checked` is the time of the last round.
+- `GET /api/status` only reads the cached round and SQLite; it never starts
+  network work. New devices appear as `unknown` in the next round or after a
+  manual refresh.
+- `POST /api/status/refresh` runs one round and returns when it finishes; a
+  second request while a round is running gets `429`.
+- The `/devices` page polls `GET /api/status` every 30 seconds and offers a
+  **Refresh status** button. The counter is "N of M online", where `partial`
+  does not count as online.
+
+### First-run migration
+
+If the `devices` table is empty and `DVR_HOST`, `DVR_USER`, and `DVR_PASS` are
+all set, the app creates one device named "Default device" from them (password
+encrypted) and records that the migration ran. It runs once; the values are
+never logged. If the three variables are not set, nothing is written and the
+migration is retried on a later start.
+
+### Frontend
+
+`/devices` reuses `styles.css` and plain JS. It provides the counter, search,
+state filter, group sections with a status dot and HTTP/RTSP flags, Add/Edit
+(with the password empty and labelled "Leave empty to keep"), Delete, per-device
+**Test connection**, group create/rename/delete, the default-credentials form,
+CSV **Preview** then **Import**, and **Refresh status**. Server strings are
+inserted with `textContent` only. The search text and state filter are kept in
+`localStorage` inside `try`/`catch`, so blocked storage cannot break the page.
+
+### Connection test
+
+`POST /api/devices/{id}/test` logs in with the effective credentials using
+`DvrClient` (5-second timeout) and logs out in a `finally` block. It is the only
+registry action that talks to a DVR, and it makes no read/RPC call beyond
+`global.login`/`global.logout`. The result is `{"ok": true}` or
+`{"ok": false, "reason": "unreachable"|"authentication failed"|"other"}` with no
+stack trace and no credentials.
 
 ## Test the client
 
@@ -620,6 +801,140 @@ names only in notes; never paste a response body, a go2rtc entry, or `.env`.
     tab close, or server shutdown. If any remain, the shutdown/startup cleanup
     should remove them on the next start; report the count and whether the
     cleanup ran, never the stream sources.
+
+## Test the registry
+
+### Offline tests (no DVR contact)
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest test_registry -v
+node --check static/devices.js
+```
+
+```bash
+.venv/bin/python -m unittest test_registry -v
+node --check static/devices.js
+```
+
+The suite uses a temporary `DATA_DIR`, an httpx mock transport for the
+connection test, fake TCP connectors for the status checker, and a fake Fernet
+key. It covers:
+
+- settings defaults, invalid numbers, and a missing/invalid `APP_SECRET_KEY`
+  (`503` with the fixed message while `/` and `/devices` still load);
+- Fernet round trip, the database file not containing a plaintext password, a
+  changed key falling back to the defaults, and no password in logs or any JSON
+  response;
+- validation (private/loopback/link-local/public IPs, hostnames, ports, names,
+  duplicates, groups);
+- default vs override credentials, update semantics (omit to keep, `""` to
+  clear, username-only changes), and a missing username/password pair;
+- CSV dry run vs real import, row numbering, bad ports, duplicates inside the
+  file and against the database, the 500-row and 256 KB limits, and new groups;
+- first-run migration once, skipped when devices exist, and skipped without
+  credentials;
+- the three connection-test outcomes with a real client over a mock transport,
+  including one logout on success and no password in the result;
+- status rounds: concurrency cap, per-port timeout, online/partial/offline,
+  `last_seen` persistence across a restart and across an offline round, snapshot
+  without network work, one round at a time, cancellation, and a failed round
+  not killing the checker;
+- the app lifespan starting and cancelling the checker on shutdown;
+- `415` for a non-JSON content type, `400` for a non-object body, and `429` for
+  a concurrent refresh.
+
+### On the Ubuntu server
+
+All steps assume the app is bound to loopback and reached through the existing
+SSH tunnel (`-L 8000:127.0.0.1:8000`). Use placeholder credentials in commands;
+do not paste a real password into a ticket or chat.
+
+1. Generate the key once and add the Phase 5a block to `.env` (see Setup). Never
+   print `.env`; check only that the key is non-empty:
+   `grep -c '^APP_SECRET_KEY=' .env` should print `1`.
+2. Restart uvicorn, then confirm the database and its permissions:
+
+   ```bash
+   ls -l data/dvr.db            # expect -rw------- on Linux
+   curl -sS http://127.0.0.1:8000/api/status
+   ```
+
+   The first response should be `{"counts": {"total": 0, ...}, ...}` when the
+   registry is empty. A `503` means the key is missing or invalid; the rest of
+   the app should still load at <http://127.0.0.1:8000>.
+3. Create a group and a device, and confirm the response has no password:
+
+   ```bash
+   curl -sS -X POST http://127.0.0.1:8000/api/groups \
+     -H 'Content-Type: application/json' -d '{"name":"Floor 1"}'
+   curl -sS -X POST http://127.0.0.1:8000/api/devices \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"Lobby","group_id":1,"host":"192.168.1.50"}'
+   curl -sS http://127.0.0.1:8000/api/devices
+   ```
+
+   The device should show `"has_own_credentials": false` and no password field.
+4. Save the default credentials and confirm only `has_password` comes back:
+
+   ```bash
+   curl -sS -X PUT http://127.0.0.1:8000/api/settings/default-credentials \
+     -H 'Content-Type: application/json' \
+     -d '{"username":"admin","password":"<dvr-password>"}'
+   curl -sS http://127.0.0.1:8000/api/settings/default-credentials
+   ```
+
+5. Test the recorder. Expect `{"ok": true}` for a reachable device with correct
+   credentials. A wrong password must return `authentication failed`, a powered
+   off device `unreachable`, and anything else `other`; none may include a
+   password or a stack trace:
+
+   ```bash
+   curl -sS -X POST http://127.0.0.1:8000/api/devices/1/test
+   ```
+
+6. Check encryption at rest without printing the password. The count must be
+   `0` and the command prints nothing else:
+
+   ```bash
+   grep -c '<dvr-password>' data/dvr.db
+   ```
+
+7. Preview and import a CSV. Start with two rows and one deliberately bad host,
+   confirm the dry run reports `ok`/`error` and writes nothing, then import:
+
+   ```bash
+   curl -sS -X POST 'http://127.0.0.1:8000/api/devices/import?dry_run=true' \
+     -H 'Content-Type: application/json' \
+     -d '{"csv":"name,group,host,http_port,rtsp_port,username,password\nCam 1,Floor 1,192.168.1.60,,,,\nBad,,999.1.1.1,,,,"}'
+   curl -sS -X POST 'http://127.0.0.1:8000/api/devices/import?dry_run=false' \
+     -H 'Content-Type: application/json' \
+     -d '{"csv":"name,group,host,http_port,rtsp_port,username,password\nCam 1,Floor 1,192.168.1.60,,,,"}'
+   ```
+
+8. Refresh the status and compare with reality:
+
+   ```bash
+   curl -sS -X POST http://127.0.0.1:8000/api/status/refresh
+   curl -sS http://127.0.0.1:8000/api/status
+   ```
+
+   Power off one recorder and refresh again: its state should become `offline`
+   while `last_seen` stays at the previous value after the page reloads. Check
+   that the background round appears every `STATUS_INTERVAL_SECONDS` in the
+   page (the browser polls every 30 seconds). A second refresh during a round
+   must return `429`.
+9. Open <http://127.0.0.1:8000/devices> through the tunnel and exercise the page:
+   the counter, search, state filter, group sections, Add/Edit/Delete,
+   **Test connection**, the default-credentials form, CSV **Preview** then
+   **Import**, **Refresh status**, and the header link back to the dashboard.
+   Edit a device without typing a password and confirm it still reports
+   "own credentials".
+10. For the 48-device inventory, import the real CSV in dry-run mode first and
+    check the row count/duplicates. A round is bounded by
+    `ceil(devices / STATUS_CONCURRENCY)` batches of two short connects each, so
+    the worst case with the defaults is about 20 seconds for 48 devices; normal
+    LAN connects finish much faster. Raise `STATUS_TIMEOUT_SECONDS` only after
+    measuring a real slow device.
 
 ## API
 
@@ -937,6 +1252,207 @@ configuration, `502` for DVR communication, login, or session failures, and `400
 for an unlisted config name. Messages never include the password, session id, or
 raw DVR payload.
 
+### Registry API (Phase 5a)
+
+All registry endpoints live under `/api` and are disabled as a group when
+`APP_SECRET_KEY` is missing or invalid: they return `503` with
+`{"error": "Device registry is not configured. Set a valid APP_SECRET_KEY in .env."}`.
+The dashboard, Live, Recordings, and Settings endpoints keep working in that
+state.
+
+Request bodies must be sent as `application/json`; any other content type gets
+`415`, and a body that is not a JSON object gets `400`. Validation failures,
+unknown `group_id`, and bad query values get `400`. Missing records get `404`,
+duplicate names or `(host, http_port)` pairs get `409`, and a second status
+refresh during a running round gets `429`. Every error body is `{"error": ...}`.
+No response contains a password, a ciphertext, the encryption key, or a stack
+trace.
+
+#### `GET /api/groups`
+
+```json
+{"groups": [{"id": 1, "name": "Floor 1", "device_count": 3}]}
+```
+
+Groups are flat and sorted by name. `device_count` counts devices in the group.
+
+#### `POST /api/groups`
+
+Body: `{"name": "Floor 1"}`. Returns `201` with `{"group": {...}}` where the
+group has `id`, `name`, and `device_count` (`0`).
+
+#### `PUT /api/groups/{id}`
+
+Body: `{"name": "Floor 2"}`. Returns `200` with the renamed group. Names are
+1–64 characters and unique case-insensitively.
+
+#### `DELETE /api/groups/{id}`
+
+Returns `{"deleted": true}`. Devices in the group are moved to "No group"; they
+are not deleted.
+
+#### `GET /api/devices?group_id=<n|none>&q=<text>`
+
+Returns `{"devices": [...]}`. Without filters it returns every device. `group_id`
+filters to one group, `group_id=none` returns devices without a group, and `q`
+(case-insensitive, up to 100 characters) matches the name, host, notes, or group
+name. Each device is:
+
+```json
+{
+  "id": 1,
+  "name": "Lobby",
+  "group_id": 1,
+  "group": "Floor 1",
+  "host": "192.168.1.50",
+  "http_port": 80,
+  "rtsp_port": 554,
+  "has_own_credentials": true,
+  "notes": "front door"
+}
+```
+
+`has_own_credentials` says whether a per-device username/password override is
+stored; the values themselves are never returned. A device without an override
+uses the default credentials.
+
+#### `POST /api/devices`
+
+Returns `201` with `{"device": {...}}` in the same shape as the list. Body:
+
+```json
+{
+  "name": "Lobby",
+  "group_id": 1,
+  "host": "192.168.1.50",
+  "http_port": 80,
+  "rtsp_port": 554,
+  "notes": "front door",
+  "username": "admin",
+  "password": "<dvr-password>"
+}
+```
+
+Only `name` and `host` are required. `group_id` is optional (`null` or omitted
+means no group; an unknown id is `400`). `http_port` defaults to `80` and
+`rtsp_port` to `554`; both must be integers 1–65535. `username` and `password`
+must be supplied together, or both omitted, to create an override. `notes` is
+optional (up to 1,000 characters).
+
+#### `PUT /api/devices/{id}`
+
+Partial update with any of the create fields. Omitted fields keep their current
+value. Omitting `password` keeps the stored override; sending `"username": ""`
+and `"password": ""` together removes the override and falls back to the
+defaults. Sending a new username without a password (or the reverse) on a device
+that has no override is `400`. Returns `200` with the updated device.
+
+#### `DELETE /api/devices/{id}`
+
+Returns `{"deleted": true}`. The record and its encrypted override are removed.
+The status list is built from the database, so the device disappears from
+`GET /api/status` immediately; its cached result is discarded on the next round.
+
+#### `GET /api/settings/default-credentials`
+
+```json
+{"username": "admin", "has_password": true}
+```
+
+The username is returned in clear text (it is stored that way); the password is
+never returned.
+
+#### `PUT /api/settings/default-credentials`
+
+Body: `{"username": "admin", "password": "<dvr-password>"}`. Both are required
+to set a pair. Returns `200` with the same shape as the `GET`. The password is
+encrypted before storage and cannot be read back through the API.
+
+#### `POST /api/devices/import?dry_run=true|false`
+
+Body: `{"csv": "name,group,...\n..."}`. `dry_run` defaults to `true`; any value
+other than `true` or `false` (case-insensitive) is `400`. The CSV format and
+limits are described in
+[CSV import](#csv-import). The response is:
+
+```json
+{
+  "dry_run": true,
+  "counts": {"rows": 2, "ok": 1, "error": 1, "duplicate": 0, "imported": 0},
+  "rows": [
+    {"row": 2, "status": "ok", "message": "Ready to add."},
+    {"row": 3, "status": "error", "message": "host is not a valid IPv4 address."}
+  ]
+}
+```
+
+`row` is the CSV line number (the header is line 1). A dry run writes nothing
+and imports nothing. A real import (`dry_run=false`) writes only `ok` rows in
+one transaction and reports `counts.imported`; invalid and duplicate rows are
+skipped. Header errors and size/row limits reject the whole request with `400`.
+No row message contains a password.
+
+#### `POST /api/devices/{id}/test`
+
+Logs in and out once with the device's effective credentials and returns `200`:
+
+```json
+{"ok": true}
+```
+
+or
+
+```json
+{"ok": false, "reason": "unreachable"}
+```
+
+`reason` is `unreachable` (no answer / timeout), `authentication failed` (the
+DVR rejected the credentials, or the device has no usable credentials), or
+`other` (an unexpected response, such as a non-JSON page). An unknown device is
+`404`. This is the only registry action that contacts a DVR; it makes no read
+call beyond `global.login`/`global.logout`.
+
+#### `GET /api/status`
+
+Returns the cached status round. It never opens a socket:
+
+```json
+{
+  "counts": {
+    "total": 3, "online": 1, "partial": 1, "offline": 1, "unknown": 0
+  },
+  "checked_at": "2026-10-27T04:57:04+00:00",
+  "devices": [
+    {
+      "id": 1,
+      "name": "Lobby",
+      "group": "Floor 1",
+      "host": "192.168.1.50",
+      "http_port": 80,
+      "rtsp_port": 554,
+      "http_ok": true,
+      "rtsp_ok": false,
+      "state": "partial",
+      "last_checked": "2026-10-27T04:57:02+00:00",
+      "last_seen": "2026-10-27T04:57:02+00:00"
+    }
+  ]
+}
+```
+
+`state` is `online` (both ports), `partial` (one port), `offline` (neither), or
+`unknown` before the first round. `checked_at` is the time the response was
+produced, so before the first round all devices are still `unknown`.
+`last_seen` is the last time a port answered and persists across restarts;
+`last_checked` is the last round's time for that device and is `null` before the
+first round.
+
+#### `POST /api/status/refresh`
+
+Runs one status round and returns the same shape when it finishes. A second
+request while a round is still running returns `429`. This is the only registry
+endpoint besides the connection test that performs network work.
+
 ## Security notes
 
 - Credentials live only in `.env`, which is ignored by `.gitignore`. Only
@@ -985,6 +1501,40 @@ raw DVR payload.
   names.
 - go2rtc is exposed to the browser only through the SSH tunnel in this phase. It
   is not proxied or authenticated by this app yet; do not expose it publicly.
+
+Phase 5a registry:
+
+- **The app has no user login.** Anyone who can reach the port can read the
+  device inventory, change it, and trigger a connection test with the stored
+  credentials. Bind uvicorn to `127.0.0.1` until an authentication phase exists;
+  do not bind `0.0.0.0`, reverse-proxy it, or publish it through a public tunnel.
+- DVR passwords for registry devices are encrypted with Fernet before they reach
+  SQLite. The only plaintext copy is the process environment / `.env`, which is
+  ignored by `.gitignore`. Never commit `data/`, paste `dvr.db`, or log
+  `APP_SECRET_KEY`.
+- The default username is stored in clear text by design; only the password is
+  encrypted. Treat the database as sensitive even so.
+- Passwords are write-only at the API boundary: only `has_own_credentials` and
+  `has_password` are returned. No password, ciphertext, or key appears in a
+  response, log line, error message, CSV preview/result, or export. Request
+  bodies are not logged.
+- Credential decryption errors are logged by exception type only and fall back
+  to the default credentials. Changing `APP_SECRET_KEY` makes every stored
+  password unreadable; re-enter them.
+- The status checker opens plain TCP connections only. It sends no HTTP request
+  and performs no login, so a port being open is the only signal.
+- The connection test reuses `DvrClient.login()`/`logout()`. Its result is one of
+  three fixed reasons; exception text, passwords, and stack traces never reach
+  the browser.
+- On POSIX, `data/dvr.db` is chmod `600` after creation (best effort; the
+  failure is ignored on Windows). The directory itself is created with the
+  process umask, so keep `DATA_DIR` on a volume only the service account can
+  read.
+- CSV import accepts passwords in the request body and encrypts them
+  immediately. The body is not stored, echoed, or included in row results.
+- Registry devices are inventory records only in this phase. They are not
+  connected to Live, Recordings, or Settings, and the checker does not read
+  device identity, channels, or footage.
 
 ## Evidence from the sources
 
@@ -1201,10 +1751,53 @@ used by this phase.
     entry per volume or per physical disk may show a different number; health is
     still based on the same state/error fields.
 
-## Out of scope for Phase 4b
+Phase 5a registry:
 
-Multiple devices, recording download or export, configuration writes,
-reboot/factory-reset/format operations, user management, scheduled keepalive,
-recording, PTZ, playback pause/speed/seek, and authentication or proxying for
-go2rtc. The go2rtc player is reached through the SSH tunnel; a later phase will
-put it behind authenticated proxying.
+43. **TCP status versus real service health.** `online`/`partial` reflect a TCP
+    connect to the configured HTTP and RTSP ports only. A recorder whose web
+    service is broken but whose port is open still counts, and a firewall that
+    accepts then drops may change the state. This was tested with fake sockets
+    and one real device at startup; compare with the actual recorders during the
+    server test.
+44. **Real inventory scale.** CSV import and the 500-row/256 KB limits were
+    tested with generated rows and a 3-row demo, and the 30-second page polling
+    was not observed with 48 devices. The default round for 48 devices is
+    estimated at up to about 20 seconds, but real LAN timing is unconfirmed.
+45. **Fernet key rotation.** There is no rotation tool. Changing the key
+    invalidates stored passwords (they fall back to the defaults with a warning)
+    and the defaults must be re-entered. This path was tested only by swapping
+    keys in a temp database, not on the server.
+46. **File permissions on Linux.** The chmod `600` call is best effort and was
+    not exercised on the Ubuntu server in this session; confirm with
+    `ls -l data/dvr.db` there.
+47. **Registry UI verification.** The page was exercised in a local browser
+    against a demo server with fake hosts (add/edit/delete, groups, CSV
+    preview/import, status refresh, search/filter, localStorage restore, header
+    links, and the 503 banner). It was not tested with real recorders, a real
+    48-device list, a blocked `localStorage`, or a mobile device.
+48. **Connection-test classification on real firmware.** The three outcomes were
+    tested with httpx mock transports plus a refused loopback port. How a real
+    Dahua answers a wrong password, an HTTP error page, or a slow challenge was
+    not observed here. The classification uses only safe exception text, so an
+    unusual message may land in `other`.
+49. **Refresh serialization.** `429` for a concurrent refresh and the background
+    task's cancellation were tested with fakes. Browser timing between the
+    30-second poll and a running round on the server is unconfirmed.
+50. **First-run migration against the real `.env`.** Migration was tested with
+    patched `DVR_*` values. On a first start with the real `.env`, confirm that
+    exactly one "Default device" appears and that the password is not in
+    `data/dvr.db` in clear text.
+51. **Single process only.** The registry and status checker use per-process
+    state. Running multiple uvicorn workers would run duplicate rounds and could
+    race on SQLite writes; use one worker in this phase.
+
+## Out of scope for Phase 5a
+
+Linking a registry device to Live, Recordings, or Settings; per-device
+credentials for those pages; application authentication or user accounts;
+multi-worker/HA deployment; registry export/import beyond the CSV described
+above; credential rotation tooling; nested groups; network discovery or
+scanning; scheduled tasks other than the status round; recording download or
+export; configuration writes; reboot/factory-reset/format; PTZ; playback
+pause/speed/seek; and authenticated proxying for go2rtc.
+

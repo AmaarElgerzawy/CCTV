@@ -29,6 +29,15 @@ from dvr_client import (
     DvrSessionExpired,
     mask_sensitive,
 )
+from registry import (
+    REGISTRY_DISABLED_MESSAGE,
+    DeviceRegistry,
+    RegistryConfigError,
+    RegistryError,
+    RegistrySettings,
+    StatusChecker,
+    StatusRoundBusy,
+)
 from stream_manager import (
     DEFAULT_PLAYBACK_SECONDS,
     PLAYBACK_MIN_SECONDS,
@@ -68,9 +77,31 @@ async def _lease_reaper(manager: StreamManager) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Create the live manager, clean leftovers, and clean up on shutdown."""
+    """Create the managers, clean leftovers, and clean up on shutdown."""
     manager: StreamManager | None = None
     reaper: asyncio.Task[None] | None = None
+    registry: DeviceRegistry | None = None
+    checker: StatusChecker | None = None
+
+    try:
+        registry_settings = RegistrySettings.from_env(BASE_DIR)
+        registry = DeviceRegistry(registry_settings)
+        checker = StatusChecker(
+            registry,
+            interval=registry_settings.status_interval,
+            concurrency=registry_settings.status_concurrency,
+            timeout=registry_settings.status_timeout,
+        )
+    except RegistryConfigError as exc:
+        logger.warning("Device registry is not configured: %s", exc)
+    except Exception as exc:  # defensive: the read-only app keeps working
+        logger.error(
+            "Device registry could not start: %s", type(exc).__name__
+        )
+
+    app.state.registry = registry
+    app.state.status_checker = checker
+
     try:
         manager = StreamManager.from_env()
     except StreamConfigError as exc:
@@ -89,9 +120,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
         reaper = asyncio.create_task(_lease_reaper(manager))
 
+    if checker is not None:
+        checker.start()
+
     try:
         yield
     finally:
+        if checker is not None:
+            with suppress(asyncio.CancelledError):
+                await checker.stop()
         if reaper is not None:
             reaper.cancel()
             with suppress(asyncio.CancelledError):
@@ -108,7 +145,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 manager.close()
 
 
-app = FastAPI(title="DVR Web", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="DVR Web", version="0.7.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -219,6 +256,11 @@ def _cgi_error(exc: CgiError) -> JSONResponse:
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/devices")
+def devices_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "devices.html")
 
 
 @app.get("/health")
@@ -556,3 +598,227 @@ def config(name: str) -> JSONResponse:
 
 def _error(status_code: int, message: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": message})
+
+
+# -- device registry (Phase 5a) ------------------------------------------
+
+
+def _registry(request: Request) -> DeviceRegistry:
+    registry = getattr(request.app.state, "registry", None)
+    if registry is None:
+        raise RegistryConfigError(REGISTRY_DISABLED_MESSAGE)
+    return registry
+
+
+def _status_checker(request: Request) -> StatusChecker:
+    checker = getattr(request.app.state, "status_checker", None)
+    if checker is None:
+        raise RegistryConfigError(REGISTRY_DISABLED_MESSAGE)
+    return checker
+
+
+def _registry_error(exc: Exception) -> JSONResponse:
+    if isinstance(exc, RegistryConfigError):
+        return _error(503, REGISTRY_DISABLED_MESSAGE)
+    if isinstance(exc, RegistryError):
+        return _error(exc.status_code, str(exc))
+    logger.error("Unexpected registry error: %s", type(exc).__name__)
+    return _error(500, "Unexpected server error.")
+
+
+async def _json_body(request: Request) -> dict[str, Any]:
+    media = request.headers.get("content-type", "").split(";", 1)[0]
+    if media.strip().lower() != "application/json":
+        raise RegistryError(
+            "Content-Type must be application/json.", 415
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        raise RegistryError("Body must be a JSON object.", 400) from None
+    if not isinstance(body, dict):
+        raise RegistryError("Body must be a JSON object.", 400)
+    return body
+
+
+@app.get("/api/groups")
+async def list_groups(request: Request) -> JSONResponse:
+    try:
+        groups = await asyncio.to_thread(_registry(request).list_groups)
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse({"groups": groups})
+
+
+@app.post("/api/groups")
+async def create_group(request: Request) -> JSONResponse:
+    try:
+        body = await _json_body(request)
+        group = await asyncio.to_thread(
+            _registry(request).create_group, body.get("name")
+        )
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse({"group": group}, status_code=201)
+
+
+@app.put("/api/groups/{group_id}")
+async def update_group(group_id: int, request: Request) -> JSONResponse:
+    try:
+        body = await _json_body(request)
+        group = await asyncio.to_thread(
+            _registry(request).update_group, group_id, body.get("name")
+        )
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse({"group": group})
+
+
+@app.delete("/api/groups/{group_id}")
+async def delete_group(group_id: int, request: Request) -> JSONResponse:
+    try:
+        await asyncio.to_thread(_registry(request).delete_group, group_id)
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse({"deleted": True})
+
+
+@app.get("/api/devices")
+async def list_devices(
+    request: Request,
+    group_id: str | None = None,
+    q: str | None = None,
+) -> JSONResponse:
+    number: int | None = None
+    ungrouped = False
+    if group_id is not None and group_id.strip():
+        value = group_id.strip()
+        if value.lower() in {"none", "null"}:
+            ungrouped = True
+        elif value.isdigit():
+            number = int(value)
+        else:
+            return _error(400, "group_id must be a group number or 'none'.")
+    if q is not None and len(q) > 100:
+        return _error(400, "q must be at most 100 characters.")
+    try:
+        devices = await asyncio.to_thread(
+            _registry(request).list_devices,
+            group_id=number,
+            ungrouped=ungrouped,
+            query=q,
+        )
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse({"devices": devices})
+
+
+@app.post("/api/devices")
+async def create_device(request: Request) -> JSONResponse:
+    try:
+        body = await _json_body(request)
+        device = await asyncio.to_thread(
+            _registry(request).create_device, body
+        )
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse({"device": device}, status_code=201)
+
+
+@app.put("/api/devices/{device_id}")
+async def update_device(device_id: int, request: Request) -> JSONResponse:
+    try:
+        body = await _json_body(request)
+        device = await asyncio.to_thread(
+            _registry(request).update_device, device_id, body
+        )
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse({"device": device})
+
+
+@app.delete("/api/devices/{device_id}")
+async def delete_device(device_id: int, request: Request) -> JSONResponse:
+    try:
+        await asyncio.to_thread(_registry(request).delete_device, device_id)
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse({"deleted": True})
+
+
+@app.get("/api/settings/default-credentials")
+async def get_default_credentials(request: Request) -> JSONResponse:
+    try:
+        result = await asyncio.to_thread(
+            _registry(request).get_default_credentials
+        )
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse(result)
+
+
+@app.put("/api/settings/default-credentials")
+async def set_default_credentials(request: Request) -> JSONResponse:
+    try:
+        body = await _json_body(request)
+        result = await asyncio.to_thread(
+            _registry(request).set_default_credentials,
+            body.get("username"),
+            body.get("password"),
+        )
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse(result)
+
+
+@app.post("/api/devices/import")
+async def import_devices(
+    request: Request, dry_run: str = "true"
+) -> JSONResponse:
+    mode = dry_run.strip().lower()
+    if mode not in {"true", "false"}:
+        return _error(400, "dry_run must be true or false.")
+    try:
+        body = await _json_body(request)
+        text = body.get("csv")
+        if not isinstance(text, str):
+            raise RegistryError("csv must be a string.")
+        result = await asyncio.to_thread(
+            _registry(request).import_csv,
+            text,
+            dry_run=mode == "true",
+        )
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse(result)
+
+
+@app.post("/api/devices/{device_id}/test")
+async def test_device(device_id: int, request: Request) -> JSONResponse:
+    try:
+        result = await asyncio.to_thread(
+            _registry(request).test_device, device_id
+        )
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse(result)
+
+
+@app.get("/api/status")
+async def registry_status(request: Request) -> JSONResponse:
+    try:
+        result = await _status_checker(request).snapshot()
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse(result)
+
+
+@app.post("/api/status/refresh")
+async def refresh_status(request: Request) -> JSONResponse:
+    try:
+        result = await _status_checker(request).refresh()
+    except StatusRoundBusy:
+        return _error(429, "A status check is already running.")
+    except Exception as exc:
+        return _registry_error(exc)
+    return JSONResponse(result)

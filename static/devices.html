@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Devices · DVR Dashboard</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Local network</p>
+        <h1>Devices</h1>
+        <p class="lede">
+          Groups, connection settings, and encrypted credentials for the
+          recorders on this network.
+        </p>
+      </div>
+      <div class="topbar-actions">
+        <a class="button button-ghost" href="/">Back to dashboard</a>
+      </div>
+    </header>
+
+    <div id="reg-status" class="status" role="status" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="reg-status-text">Loading devices…</span>
+    </div>
+
+    <section class="panel" aria-labelledby="list-title">
+      <div class="panel-head">
+        <h2 id="list-title">Devices</h2>
+        <span id="status-counts" class="badge">—</span>
+      </div>
+      <div class="registry-toolbar">
+        <label class="recordings-field" for="device-search">
+          Search
+          <input
+            id="device-search"
+            type="search"
+            placeholder="Name or host"
+          >
+        </label>
+        <label class="recordings-field" for="device-state">
+          State
+          <select id="device-state">
+            <option value="all">All</option>
+            <option value="online">Online</option>
+            <option value="partial">Partial</option>
+            <option value="offline">Offline</option>
+            <option value="unknown">Unknown</option>
+          </select>
+        </label>
+        <button
+          id="status-refresh"
+          class="button button-ghost"
+          type="button"
+        >
+          Refresh status
+        </button>
+      </div>
+      <p id="device-note" class="section-note">Loading devices…</p>
+      <div id="device-groups" class="device-groups"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="form-title">
+      <div class="panel-head">
+        <h2 id="form-title">Add device</h2>
+        <button
+          id="form-cancel"
+          class="button button-ghost button-small"
+          type="button"
+          hidden
+        >
+          Cancel edit
+        </button>
+      </div>
+      <form id="device-form" class="registry-form">
+        <label class="registry-field">
+          Name
+          <input id="device-name" maxlength="64" required>
+        </label>
+        <label class="registry-field">
+          Group
+          <select id="device-group">
+            <option value="">No group</option>
+          </select>
+        </label>
+        <label class="registry-field">
+          Host or IP
+          <input id="device-host" required placeholder="192.168.1.50">
+        </label>
+        <label class="registry-field">
+          HTTP port
+          <input
+            id="device-http-port"
+            type="number"
+            min="1"
+            max="65535"
+            value="80"
+            required
+          >
+        </label>
+        <label class="registry-field">
+          RTSP port
+          <input
+            id="device-rtsp-port"
+            type="number"
+            min="1"
+            max="65535"
+            value="554"
+            required
+          >
+        </label>
+        <label class="registry-field">
+          Username
+          <input
+            id="device-username"
+            autocomplete="off"
+            placeholder="Use the default credentials"
+          >
+        </label>
+        <label class="registry-field">
+          Password
+          <input
+            id="device-password"
+            type="password"
+            autocomplete="new-password"
+            placeholder="Leave empty to keep"
+          >
+        </label>
+        <label class="registry-field registry-check registry-wide">
+          <input id="device-clear-creds" type="checkbox">
+          Use the default credentials (clears this device's own credentials)
+        </label>
+        <label class="registry-field registry-wide">
+          Notes
+          <input id="device-notes" maxlength="1000">
+        </label>
+        <p id="form-note" class="section-note registry-wide">
+          A device with no username and password uses the default credentials.
+        </p>
+        <div class="registry-wide registry-actions">
+          <button id="device-save" class="button" type="submit">
+            Save device
+          </button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel" aria-labelledby="groups-title">
+      <div class="panel-head">
+        <h2 id="groups-title">Groups</h2>
+        <span class="muted">Flat groups</span>
+      </div>
+      <form id="group-form" class="registry-inline">
+        <input
+          id="group-name"
+          maxlength="64"
+          placeholder="New group name"
+          required
+        >
+        <button class="button" type="submit">Add group</button>
+      </form>
+      <p id="group-note" class="section-note">No groups yet.</p>
+      <ul id="group-list" class="group-list"></ul>
+    </section>
+
+    <section class="panel" aria-labelledby="default-title">
+      <div class="panel-head">
+        <h2 id="default-title">Default credentials</h2>
+      </div>
+      <p id="default-note" class="section-note">Loading…</p>
+      <form id="default-form" class="registry-inline">
+        <input
+          id="default-username"
+          maxlength="64"
+          placeholder="Default username"
+          autocomplete="off"
+          required
+        >
+        <input
+          id="default-password"
+          type="password"
+          placeholder="New default password"
+          autocomplete="new-password"
+          required
+        >
+        <button class="button" type="submit">Save default</button>
+      </form>
+      <p class="section-note">
+        The password is write-only. It is stored encrypted and never returned
+        by the API.
+      </p>
+    </section>
+
+    <section class="panel" aria-labelledby="csv-title">
+      <div class="panel-head">
+        <h2 id="csv-title">CSV import</h2>
+        <span class="muted">Up to 500 rows</span>
+      </div>
+      <p class="section-note">
+        Header row:
+        <code>name,group,host,http_port,rtsp_port,username,password</code>.
+        Only name and host are required; an optional group is created when
+        missing. Preview first; Import writes only the valid rows.
+      </p>
+      <label class="registry-field registry-wide">
+        CSV
+        <textarea
+          id="csv-text"
+          rows="6"
+          spellcheck="false"
+          placeholder="name,group,host,http_port,rtsp_port,username,password"
+        ></textarea>
+      </label>
+      <div class="registry-actions">
+        <button id="csv-preview" class="button button-ghost" type="button">
+          Preview
+        </button>
+        <button id="csv-import" class="button" type="button" disabled>
+          Import
+        </button>
+      </div>
+      <p id="csv-note" class="section-note"></p>
+      <div id="csv-result" class="table-wrap"></div>
+    </section>
+
+    <p class="footer">
+      Only <strong>Test connection</strong> contacts a recorder, with one login
+      and one logout. This page is bound to the local server and has no user
+      login yet.
+    </p>
+  </main>
+  <script src="/static/devices.js" defer></script>
+</body>
+</html>
