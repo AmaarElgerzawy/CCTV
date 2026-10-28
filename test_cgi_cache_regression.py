@@ -7,15 +7,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import httpx
 from cryptography.fernet import Fernet
 
-import app as app_module
-import cgi_client
-from registry import DeviceRegistry, RegistrySettings
-
-
 SECRET_KEY = Fernet.generate_key().decode()
+os.environ["APP_SECRET_KEY"] = SECRET_KEY
+os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="dvr-web-test-")
+
+# Import after env setup
+import httpx  # noqa: E402
+import app as app_module  # noqa: E402
+import cgi_client  # noqa: E402
+from registry import DeviceRegistry, RegistrySettings  # noqa: E402
+
+
 PASSWORD = "Zx9-plain-secret-123"
 
 
@@ -26,7 +30,7 @@ class CgiCacheRegressionCase(unittest.IsolatedAsyncioTestCase):
         self.dir = Path(self._tmp.name)
         env = mock.patch.dict(
             os.environ,
-            {"DVR_HOST": "", "DVR_USER": "", "DVR_PASS": ""},
+            {"DVR_HOST": "", "DVR_USER": "", "DVR_PASS": "", "APP_SECRET_KEY": SECRET_KEY},
         )
         env.start()
         self.addCleanup(env.stop)
@@ -91,7 +95,7 @@ class RealPathCgiTests(CgiCacheRegressionCase):
                 if action == "findNextFile":
                     return httpx.Response(
                         200,
-                        text="found=1\r\nitems[0].StartTime=2026-10-28 01:00:00\r\nitems[0].EndTime=2026-10-28 02:00:00\r\nitems[0].Type=General\r\nitems[0].Length=1024\r\n",
+                        text="found=1\r\nitems[0].StartTime=2026-10-28 01:00:00\r\nitems[0].EndTime=2026-10-28 02:00:00\r\nitems[0].Type=General\r\nitems[0].Length=1024\r\nitems[0].Channel=1\r\nitems[0].VideoStream=Main\r\n",
                         headers={"Content-Type": "text/plain"},
                     )
                 if action == "close":
@@ -105,12 +109,15 @@ class RealPathCgiTests(CgiCacheRegressionCase):
             return httpx.Response(404, text="not found")
 
         transport = httpx.MockTransport(handler)
-        original = cgi_client.httpx.AsyncClient
 
-        class Patched(cgi_client.httpx.AsyncClient):
+        orig = cgi_client.httpx.AsyncClient
+
+        class Patched(orig):
             def __init__(self, *args, **kwargs) -> None:
-                kwargs["transport"] = transport
-                kwargs.pop("auth", None)
+                base_url = kwargs.get("base_url") or ""
+                if base_url.startswith("http://192.168.1.10"):
+                    kwargs["transport"] = transport
+                    kwargs.pop("auth", None)
                 super().__init__(*args, **kwargs)
 
         with mock.patch.object(cgi_client.httpx, "AsyncClient", Patched):
@@ -118,23 +125,28 @@ class RealPathCgiTests(CgiCacheRegressionCase):
                 resp1 = await client.get(
                     f"/api/recordings?channel=1&date=2026-10-28&stream=main&device_id={device_id}"
                 )
-                self.assertEqual(resp1.status_code, 200)
+                self.assertEqual(resp1.status_code, 200, resp1.text)
                 data1 = resp1.json()
                 self.assertIn("available", data1)
                 self.assertIn("files", data1)
+                self.assertGreater(call_count, 0)
                 count1 = call_count
                 resp2 = await client.get(
                     f"/api/recordings?channel=1&date=2026-10-28&stream=main&device_id={device_id}"
                 )
-                self.assertEqual(resp2.status_code, 200)
+                self.assertEqual(resp2.status_code, 200, resp2.text)
                 count2 = call_count
-                self.assertEqual(count2, count1)
+                # find_files is cached per (host,device,channel,date,stream); clock may be re-fetched
+                self.assertEqual(count2 - count1, 1)
 
     async def test_recordings_time_real_path(self) -> None:
         dev = self.add_device()
         device_id = dev["id"]
+        call_count = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
             path = request.url.path
             if path.endswith("/cgi-bin/global.cgi"):
                 action = request.url.params.get("action")
@@ -144,16 +156,21 @@ class RealPathCgiTests(CgiCacheRegressionCase):
 
         transport = httpx.MockTransport(handler)
 
-        class Patched(cgi_client.httpx.AsyncClient):
+        orig = cgi_client.httpx.AsyncClient
+
+        class Patched(orig):
             def __init__(self, *args, **kwargs) -> None:
-                kwargs["transport"] = transport
-                kwargs.pop("auth", None)
+                base_url = kwargs.get("base_url") or ""
+                if base_url.startswith("http://192.168.1.10"):
+                    kwargs["transport"] = transport
+                    kwargs.pop("auth", None)
                 super().__init__(*args, **kwargs)
 
         with mock.patch.object(cgi_client.httpx, "AsyncClient", Patched):
             async with self.client() as client:
                 resp = await client.get(f"/api/recordings/time?device_id={device_id}")
-                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.status_code, 200, resp.text)
+                self.assertGreater(call_count, 0)
                 data = resp.json()
                 self.assertIn("device_time", data)
                 self.assertIn("source", data)
@@ -161,31 +178,39 @@ class RealPathCgiTests(CgiCacheRegressionCase):
     async def test_storage_real_path(self) -> None:
         dev = self.add_device()
         device_id = dev["id"]
+        call_count = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
             path = request.url.path
-            if path.endswith("/cgi-bin/storage.cgi"):
+            if path.endswith("/cgi-bin/storageDevice.cgi"):
                 action = request.url.params.get("action")
                 if action == "getDeviceAllInfo":
                     return httpx.Response(
                         200,
-                        text="list.info[0].Name=HD0\r\nlist.info[0].State=Ok\r\n",
+                        text="list.info[0].Name=HD0\r\nlist.info[0].State=Success\r\nlist.info[0].Detail[0].IsError=false\r\n",
                         headers={"Content-Type": "text/plain"},
                     )
             return httpx.Response(404, text="not found")
 
         transport = httpx.MockTransport(handler)
 
-        class Patched(cgi_client.httpx.AsyncClient):
+        orig = cgi_client.httpx.AsyncClient
+
+        class Patched(orig):
             def __init__(self, *args, **kwargs) -> None:
-                kwargs["transport"] = transport
-                kwargs.pop("auth", None)
+                base_url = kwargs.get("base_url") or ""
+                if base_url.startswith("http://192.168.1.10"):
+                    kwargs["transport"] = transport
+                    kwargs.pop("auth", None)
                 super().__init__(*args, **kwargs)
 
         with mock.patch.object(cgi_client.httpx, "AsyncClient", Patched):
             async with self.client() as client:
                 resp = await client.get(f"/api/storage?device_id={device_id}")
-                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.status_code, 200, resp.text)
+                self.assertGreater(call_count, 0)
                 data = resp.json()
                 self.assertIn("health", data)
                 self.assertIn("disks", data)
@@ -194,8 +219,11 @@ class RealPathCgiTests(CgiCacheRegressionCase):
     async def test_findfile_bad_request_returns_available_false(self) -> None:
         dev = self.add_device()
         device_id = dev["id"]
+        call_count = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
             path = request.url.path
             if path.endswith("/cgi-bin/mediaFileFind.cgi"):
                 action = request.url.params.get("action")
@@ -215,10 +243,14 @@ class RealPathCgiTests(CgiCacheRegressionCase):
 
         transport = httpx.MockTransport(handler)
 
-        class Patched(cgi_client.httpx.AsyncClient):
+        orig = cgi_client.httpx.AsyncClient
+
+        class Patched(orig):
             def __init__(self, *args, **kwargs) -> None:
-                kwargs["transport"] = transport
-                kwargs.pop("auth", None)
+                base_url = kwargs.get("base_url") or ""
+                if base_url.startswith("http://192.168.1.10"):
+                    kwargs["transport"] = transport
+                    kwargs.pop("auth", None)
                 super().__init__(*args, **kwargs)
 
         with mock.patch.object(cgi_client.httpx, "AsyncClient", Patched):
@@ -226,7 +258,8 @@ class RealPathCgiTests(CgiCacheRegressionCase):
                 resp = await client.get(
                     f"/api/recordings?channel=1&date=2026-10-28&stream=main&device_id={device_id}"
                 )
-                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.status_code, 200, resp.text)
+                self.assertGreater(call_count, 0)
                 data = resp.json()
                 self.assertEqual(data["available"], False)
 

@@ -8,6 +8,7 @@ class StaticChecks(unittest.TestCase):
     def test_pyflakes_no_undefined_name(self) -> None:
         try:
             import pyflakes  # noqa: F401
+            _ = pyflakes
         except Exception:
             self.skipTest("pyflakes not installed")
         root = os.path.dirname(os.path.abspath(__file__))
