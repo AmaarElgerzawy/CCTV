@@ -11,3 +11,15 @@ scratch_*.py
 tmp_*.py
 trace_*.py
 scratch/
+
+run_*.py
+check_*.py
+grep_*.py
+show_*.py
+read_*.py
+look_*.py
+find_*.py
+del_*.py
+clean_*.py
+count_*.py
+sim_*.py
