@@ -1128,7 +1128,12 @@ async def test_device(device_id: int, request: Request) -> JSONResponse:
 @app.get("/api/status")
 async def registry_status(request: Request) -> JSONResponse:
     try:
-        result = await _status_checker(request).snapshot()
+        checker = _status_checker(request)
+        res = checker.snapshot()
+        if asyncio.iscoroutine(res):
+            result = await res
+        else:
+            result = res
     except Exception as exc:
         return _registry_error(exc)
     return JSONResponse(result)
@@ -1137,7 +1142,12 @@ async def registry_status(request: Request) -> JSONResponse:
 @app.post("/api/status/refresh")
 async def refresh_status(request: Request) -> JSONResponse:
     try:
-        result = await _status_checker(request).refresh()
+        checker = _status_checker(request)
+        res = checker.refresh()
+        if asyncio.iscoroutine(res):
+            result = await res
+        else:
+            result = res
     except StatusRoundBusy:
         return _error(429, "A status check is already running.")
     except Exception as exc:
@@ -1216,10 +1226,28 @@ def _status_cache_getter(device_id: int):
     if checker is None:
         return None
     try:
-        snap = checker.snapshot()
-        for d in snap.get("devices") or []:
-            if d.get("id") == device_id:
-                return d
+        # snapshot is async, but we need sync access; try to get cached results
+        if hasattr(checker, "_results"):
+            res = getattr(checker, "_results")
+            if isinstance(res, dict) and device_id in res:
+                cached = res[device_id]
+                return {
+                    "id": device_id,
+                    "state": cached.get("state"),
+                    "http_ok": cached.get("http_ok"),
+                    "rtsp_ok": cached.get("rtsp_ok"),
+                }
+        # try snapshot sync if possible
+        try:
+            import asyncio
+            snap = checker.snapshot()
+            if asyncio.iscoroutine(snap):
+                return None  # can't await in sync context
+            for d in (snap.get("devices") if isinstance(snap, dict) else []) or []:
+                if d.get("id") == device_id:
+                    return d
+        except Exception:
+            pass
     except Exception:
         pass
     return None
@@ -1234,19 +1262,38 @@ async def _run_health_round() -> None:
     # ensure tcp status is fresh if cache empty
     checker = getattr(app.state, "status_checker", None)
     try:
-        if checker is not None and hasattr(checker, "snapshot"):
-            snap = checker.snapshot()
-            devs_snap = snap.get("devices") if isinstance(snap, dict) else None
+        if checker is not None:
+            if hasattr(checker, "snapshot"):
+                try:
+                    snap = checker.snapshot()
+                    if asyncio.iscoroutine(snap):
+                        snap = await snap
+                    devs_snap = snap.get("devices") if isinstance(snap, dict) else None
+                except Exception:
+                    devs_snap = None
+            else:
+                devs_snap = None
             if not devs_snap:
                 try:
-                    if hasattr(checker, "run_once"):
-                        await checker.run_once()
+                    if hasattr(checker, "refresh"):
+                        res = checker.refresh()
+                        if asyncio.iscoroutine(res):
+                            await res
+                    elif hasattr(checker, "run_once"):
+                        res = checker.run_once()
+                        if asyncio.iscoroutine(res):
+                            await res
                 except Exception:
                     pass
     except Exception:
         pass
     try:
-        devices = registry.get_all_devices()
+        if hasattr(registry, "get_all_devices"):
+            devices = registry.get_all_devices()
+        elif hasattr(registry, "list_devices"):
+            devices = registry.list_devices()
+        else:
+            devices = []
     except Exception:
         devices = []
     to_check = []
@@ -1340,9 +1387,16 @@ async def api_health() -> JSONResponse:
         return JSONResponse({"devices": [], "summary": {"ok": 0, "stale": 0, "problems": 0, "offline": 0, "unknown": 0}, "round": dict(_HEALTH_ROUND_META)})
     try:
         health_all = registry.get_all_health()
-        devices = registry.get_all_devices()
     except Exception:
         health_all = {}
+    try:
+        if hasattr(registry, "get_all_devices"):
+            devices = registry.get_all_devices()
+        elif hasattr(registry, "list_devices"):
+            devices = registry.list_devices()
+        else:
+            devices = []
+    except Exception:
         devices = []
     out_devices = []
     summary = {"ok": 0, "stale": 0, "problems": 0, "offline": 0, "unknown": 0}
@@ -1410,13 +1464,27 @@ async def api_health_check_all() -> JSONResponse:
     registry = getattr(app.state, "registry", None)
     checker = getattr(app.state, "status_checker", None)
     try:
-        if checker is not None and hasattr(checker, "snapshot"):
-            snap = checker.snapshot()
-            devs_snap = snap.get("devices") if isinstance(snap, dict) else None
+        if checker is not None:
+            try:
+                if hasattr(checker, "snapshot"):
+                    snap = checker.snapshot()
+                    if asyncio.iscoroutine(snap):
+                        snap = await snap
+                    devs_snap = snap.get("devices") if isinstance(snap, dict) else None
+                else:
+                    devs_snap = None
+            except Exception:
+                devs_snap = None
             if not devs_snap:
                 try:
-                    if hasattr(checker, "run_once"):
-                        await checker.run_once()
+                    if hasattr(checker, "refresh"):
+                        res = checker.refresh()
+                        if asyncio.iscoroutine(res):
+                            await res
+                    elif hasattr(checker, "run_once"):
+                        res = checker.run_once()
+                        if asyncio.iscoroutine(res):
+                            await res
                 except Exception:
                     pass
     except Exception:
@@ -1429,7 +1497,15 @@ async def api_health_check_all() -> JSONResponse:
         targets = 0
         try:
             if registry is not None:
-                devs = registry.get_all_devices()
+                try:
+                    if hasattr(registry, "get_all_devices"):
+                        devs = registry.get_all_devices()
+                    elif hasattr(registry, "list_devices"):
+                        devs = registry.list_devices()
+                    else:
+                        devs = []
+                except Exception:
+                    devs = []
                 for d in devs:
                     did = d.get("id") if isinstance(d, dict) else None
                     if did is None:
