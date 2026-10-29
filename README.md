@@ -1820,3 +1820,8 @@ scanning; scheduled tasks other than the status round; recording download or
 export; configuration writes; reboot/factory-reset/format; PTZ; playback
 pause/speed/seek; and authenticated proxying for go2rtc.
 
+
+
+## Project rules
+- No scratch or debug scripts in the repository; temporary investigation scripts live in scratch/ (git-ignored) and must never read .env or contact a real device.
+- Every bug fix comes with a test that goes through the real code path and is shown to fail without the fix.

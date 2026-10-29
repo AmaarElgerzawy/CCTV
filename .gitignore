@@ -1,4 +1,13 @@
 .env
 .venv/
 __pycache__/
-data/
+data/data/
+*.db
+.env
+.venv/
+__pycache__/
+debug_*.py
+scratch_*.py
+tmp_*.py
+trace_*.py
+scratch/
