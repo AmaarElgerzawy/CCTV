@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DVR Dashboard</title>
+  <link rel="stylesheet" href="/static/styles.css?v=0.7.0">
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Local network</p>
+        <h1>DVR overview</h1>
+        <p class="lede">
+          Read-only device identity, video input channels, and selected
+          configuration from the recorder.
+        </p>
+        <div class="device-header">
+          <div class="device-header-info">
+            <div class="device-header-row">
+              <span class="device-header-label">Device</span>
+              <span id="dashboard-device-name" class="device-header-value">—</span>
+            </div>
+            <div class="device-header-row">
+              <span class="device-header-label">Group</span>
+              <span id="dashboard-device-group" class="device-header-value">—</span>
+            </div>
+            <div class="device-header-row">
+              <span class="device-header-label">State</span>
+              <span id="dashboard-device-state" class="badge">—</span>
+            </div>
+          </div>
+          <label class="device-header-select" for="dashboard-device-select">
+            Select device
+            <select id="dashboard-device-select"></select>
+          </label>
+          <p id="dashboard-device-offline" class="section-note error" hidden>Device is offline</p>
+          <p id="dashboard-device-picker" class="section-note warn" hidden>
+            No device selected. <a href="/devices">Choose a device</a>.
+          </p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <a class="button button-ghost" href="/devices">Devices</a>
+        <button id="refresh" class="button" type="button">Refresh</button>
+      </div>
+    </header>
+
+    <div id="status" class="status" role="status" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="status-text">Loading device information…</span>
+    </div>
+
+    <section class="summary" aria-label="Device summary">
+      <article class="card">
+        <p class="card-label">Device type</p>
+        <p id="device-type" class="card-value">—</p>
+      </article>
+      <article class="card">
+        <p class="card-label">Device class</p>
+        <p id="device-class" class="card-value">—</p>
+      </article>
+      <article class="card">
+        <p class="card-label">Software version</p>
+        <p id="software-version" class="card-value">—</p>
+      </article>
+      <article class="card">
+        <p class="card-label">Build date</p>
+        <p id="build-date" class="card-value">—</p>
+      </article>
+    </section>
+    <p id="failed-calls" class="failed-note" hidden></p>
+    <p class="summary-note">
+      Each card comes from a separate read-only DVR call. Every reported field
+      is listed below as a fallback.
+    </p>
+
+    <section class="panel" aria-labelledby="live-title">
+      <div class="panel-head">
+        <h2 id="live-title">Live view</h2>
+        <span class="muted">On demand</span>
+      </div>
+      <div class="live-toolbar">
+        <div class="live-toolbar-actions">
+          <button id="live-connect" class="button" type="button">
+            Connect
+          </button>
+          <button
+            id="live-disconnect"
+            class="button button-ghost"
+            type="button"
+          >
+            Disconnect
+          </button>
+        </div>
+        <label class="live-quality" for="live-quality">
+          Grid quality
+          <select id="live-quality">
+            <option value="sub" selected>Sub</option>
+            <option value="main">Main</option>
+          </select>
+        </label>
+      </div>
+      <p id="live-status" class="section-note">
+        Loading live-view configuration…
+      </p>
+      <div id="live-large" class="live-large" hidden>
+        <div class="live-large-head">
+          <h3 id="live-large-title">Larger view</h3>
+          <button
+            id="live-large-close"
+            class="button button-ghost button-small"
+            type="button"
+          >
+            Close larger view
+          </button>
+        </div>
+        <div id="live-large-frame" class="live-frame live-frame-large"></div>
+      </div>
+      <div id="live-grid" class="live-grid"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="recordings-title">
+      <div class="panel-head">
+        <h2 id="recordings-title">Recordings</h2>
+        <span id="rec-health" class="badge">Storage unknown</span>
+      </div>
+      <div class="recordings-toolbar">
+        <label class="recordings-field" for="rec-channel">
+          Channel
+          <select id="rec-channel"></select>
+        </label>
+        <label class="recordings-field" for="rec-date">
+          Date
+          <input id="rec-date" type="date">
+        </label>
+        <label class="recordings-field" for="rec-stream">
+          Stream
+          <select id="rec-stream">
+            <option value="main" selected>Main</option>
+            <option value="sub">Sub</option>
+          </select>
+        </label>
+        <button id="rec-load" class="button" type="button">Load</button>
+      </div>
+      <p id="rec-status" class="section-note">
+        Choose a date and press Load.
+      </p>
+      <p id="rec-summary" class="section-note" hidden></p>
+      <div id="rec-timeline-wrap" class="recordings-timeline-wrap" hidden>
+        <div
+          id="rec-timeline"
+          class="recordings-timeline"
+          title="Click to mark a time"
+        >
+          <span id="rec-cursor" class="rec-cursor" aria-hidden="true"></span>
+        </div>
+        <div class="recordings-ticks" aria-hidden="true">
+          <span>00</span>
+          <span>03</span>
+          <span>06</span>
+          <span>09</span>
+          <span>12</span>
+          <span>15</span>
+          <span>18</span>
+          <span>21</span>
+          <span>24</span>
+        </div>
+        <div class="rec-legend">
+          <span class="rec-legend-item">
+            <span
+              class="rec-swatch rec-swatch-timing"
+              aria-hidden="true"
+            ></span>
+            Timing
+          </span>
+          <span class="rec-legend-item">
+            <span
+              class="rec-swatch rec-swatch-event"
+              aria-hidden="true"
+            ></span>
+            Event
+          </span>
+          <span class="rec-legend-item">
+            <span
+              class="rec-swatch rec-swatch-other"
+              aria-hidden="true"
+            ></span>
+            Other
+          </span>
+        </div>
+        <p id="rec-selected" class="section-note">
+          Click the timeline to mark a time.
+        </p>
+        <div id="rec-playback" class="playback">
+          <div class="playback-controls">
+            <button
+              id="rec-play-here"
+              class="button button-small"
+              type="button"
+              disabled
+            >
+              Play from here
+            </button>
+            <button
+              id="rec-prev-clip"
+              class="button button-ghost button-small"
+              type="button"
+              disabled
+            >
+              Previous clip
+            </button>
+            <button
+              id="rec-next-clip"
+              class="button button-ghost button-small"
+              type="button"
+              disabled
+            >
+              Next clip
+            </button>
+            <button
+              id="rec-stop"
+              class="button button-ghost button-small"
+              type="button"
+              disabled
+            >
+              Stop
+            </button>
+          </div>
+          <p
+            id="rec-playback-status"
+            class="section-note"
+            role="status"
+            aria-live="polite"
+          >
+            Choose a clip or a time to play.
+          </p>
+          <div id="rec-playback-frame" class="live-frame playback-frame"></div>
+        </div>
+      </div>
+      <details id="rec-files-details" class="subraw" hidden>
+        <summary>Files</summary>
+        <div id="rec-files" class="table-wrap"></div>
+      </details>
+    </section>
+
+    <details class="panel panel-collapse">
+      <summary>
+        Reported device fields
+        <span id="field-count" class="muted"></span>
+      </summary>
+      <dl id="details" class="details">
+        <div class="empty">No fields to display.</div>
+      </dl>
+    </details>
+
+    <section class="panel" aria-labelledby="channels-title">
+      <div class="panel-head">
+        <h2 id="channels-title">Channels</h2>
+        <span id="channel-count" class="badge">—</span>
+      </div>
+      <p id="channels-status" class="section-note">Loading channels…</p>
+      <div id="channel-names" class="name-list"></div>
+      <div id="channel-counts" class="table-wrap"></div>
+      <details class="subraw">
+        <summary>Raw channels response</summary>
+        <pre id="channels-raw">—</pre>
+      </details>
+    </section>
+
+    <section class="panel" aria-labelledby="settings-title">
+      <div class="panel-head">
+        <h2 id="settings-title">Settings</h2>
+        <span class="muted">Read-only configuration</span>
+      </div>
+      <div class="config-grid">
+        <article class="config-block">
+          <h3>Network</h3>
+          <button id="network-load" class="button button-ghost button-small" type="button">Load Network</button>
+          <p id="network-status" class="section-note">Not loaded.</p>
+          <div id="network-table" class="table-wrap"></div>
+          <details class="subraw">
+            <summary>Raw Network response</summary>
+            <pre id="network-raw">—</pre>
+          </details>
+        </article>
+        <article class="config-block">
+          <h3>Encode</h3>
+          <button id="encode-load" class="button button-ghost button-small" type="button">Load Encode</button>
+          <p id="encode-status" class="section-note">Not loaded.</p>
+          <details class="subraw">
+            <summary>Encode fields</summary>
+            <div id="encode-table" class="table-wrap"></div>
+          </details>
+          <details class="subraw">
+            <summary>Raw Encode response</summary>
+            <pre id="encode-raw">—</pre>
+          </details>
+        </article>
+      </div>
+    </section>
+
+    <details class="panel raw">
+      <summary>Raw API response</summary>
+      <pre id="raw">—</pre>
+    </details>
+
+    <footer class="footer">
+      <span id="updated">Not loaded yet</span>
+      <span>Data comes from the DVR over your local network.</span>
+    </footer>
+  </main>
+
+  <script src="/static/playback_clips.js?v=0.7.0" defer></script>
+  <script src="/static/device_selector.js?v=0.7.0" defer></script>
+  <script src="/static/app.js?v=0.7.0" defer></script>
+</body>
+</html>

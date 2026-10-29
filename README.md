@@ -1825,3 +1825,9 @@ pause/speed/seek; and authenticated proxying for go2rtc.
 ## Project rules
 - No scratch or debug scripts in the repository; temporary investigation scripts live in scratch/ (git-ignored) and must never read .env or contact a real device.
 - Every bug fix comes with a test that goes through the real code path and is shown to fail without the fix.
+
+## Phase 6a: device and channel health
+- Read-only health checks using existing RPC/CGI/storage/clock calls. 
+- Config in .env.example: DEEP_CHECK_INTERVAL_MINUTES, DEEP_CHECK_CONCURRENCY, STALE_HOURS_DEFAULT, LOOKBACK_WINDOWS_HOURS.
+- Health results cached in device_health table; GET /api/health never triggers network work. POST /api/devices/{id}/health/check rate-limited (30s). POST /api/health/check-all returns 202 or 409 if running.
+- UI at /status with summary, filters, per-device/channel states. Per-device unused channels and stale_hours configurable on Devices page.

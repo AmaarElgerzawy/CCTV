@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Health Status · DVR Dashboard</title>
+  <link rel="stylesheet" href="/static/styles.css?v=0.7.0">
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Local network</p>
+        <h1>Device and channel health</h1>
+        <p class="lede">Read-only status across devices and channels.</p>
+      </div>
+      <div class="topbar-actions">
+        <a class="button button-ghost" href="/">Dashboard</a>
+        <a class="button button-ghost" href="/devices">Devices</a>
+        <button id="check-all" class="button" type="button">Check all (slow)</button>
+      </div>
+    </header>
+
+    <div id="status" class="status" role="status" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="status-text">Loading health…</span>
+    </div>
+
+    <section class="summary" aria-label="Health summary">
+      <article class="card"><p class="card-label">OK</p><p id="sum-ok" class="card-value">—</p></article>
+      <article class="card"><p class="card-label">Stale</p><p id="sum-stale" class="card-value">—</p></article>
+      <article class="card"><p class="card-label">Problems</p><p id="sum-problems" class="card-value">—</p></article>
+      <article class="card"><p class="card-label">Offline</p><p id="sum-offline" class="card-value">—</p></article>
+      <article class="card"><p class="card-label">Unknown</p><p id="sum-unknown" class="card-value">—</p></article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Devices</h2>
+        <div class="recordings-toolbar">
+          <label class="recordings-field">Search <input id="health-search" type="search" placeholder="Name or host"></label>
+          <label class="recordings-field">Filter
+            <select id="health-filter">
+              <option value="all">All</option>
+              <option value="problems">Problems only</option>
+            </select>
+          </label>
+          <label class="recordings-field"><input id="health-group" type="checkbox"> Group by group</label>
+        </div>
+      </div>
+      <p id="health-note" class="section-note">Loading…</p>
+      <div id="health-list"></div>
+    </section>
+  </main>
+  <script src="/static/status.js?v=0.7.0" defer></script>
+</body>
+</html>

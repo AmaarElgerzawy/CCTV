@@ -26,7 +26,7 @@ import os
 import re
 import threading
 import time
-from datetime import date as date_cls, datetime, time as time_cls
+from datetime import date as date_cls, datetime, time as time_cls, timedelta
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -627,3 +627,136 @@ def day_summary(files: list[dict[str, Any]], day: date_cls) -> dict[str, Any]:
         ),
         "gaps": gaps,
     }
+
+
+    async def find_last_recording(self, channel: int, device_now: str, windows: list[int] | None = None) -> dict[str, Any]:
+        """Query windows [device_now - w, device_now] in order; stop at first with files.
+        Cap 5 pages per window; if capped mark approximate. Return last_end/window/approximate or none.
+        """
+        if windows is None:
+            windows = [1, 6, 24, 72]
+        try:
+            now_dt = datetime.strptime(device_now.strip(), _TIME_FORMAT)
+        except Exception:
+            now_dt = datetime.now()
+        # try each window
+        for w in windows:
+            try:
+                w_int = int(w)
+            except Exception:
+                continue
+            start_dt = now_dt - timedelta(hours=w_int)
+            # query from start_dt to now_dt across days as needed; easier to do per-day search by iterating days
+            # find files in range by calling find_files logic? but find_files searches full day; better to search each day in range and collect
+            # but to be efficient and follow existing paging rules, search days from start_dt.date() to now_dt.date()
+            files_all = []
+            # determine days
+            d0 = start_dt.date()
+            d1 = now_dt.date()
+            # iterate days
+            from datetime import date as date_cls2
+            cur = d0
+            while cur <= d1:
+                # search this day with main first? task says "query ..." - use main stream like normal? check existing behavior; use main
+                try:
+                    res = await self._find_files_range(channel, cur, start_dt if cur == d0 else None, now_dt if cur == d1 else None)
+                except CgiAuthError:
+                    raise
+                except CgiNetworkError:
+                    raise
+                except CgiError:
+                    # treat as unavailable for search? but per call
+                    res = {"available": False, "files": [], "truncated": False}
+                except Exception:
+                    res = {"available": False, "files": [], "truncated": False}
+                if res.get("available"):
+                    files_all.extend(res.get("files") or [])
+                cur = date_cls2.fromordinal(cur.toordinal() + 1)
+            # filter to window
+            in_win = []
+            for f in files_all:
+                try:
+                    st = datetime.strptime(f["start"], _TIME_FORMAT)
+                    et = datetime.strptime(f["end"], _TIME_FORMAT)
+                except Exception:
+                    continue
+                if et < start_dt or st > now_dt:
+                    continue
+                in_win.append(f)
+            if in_win:
+                in_win.sort(key=lambda x: x["start"])
+                last = in_win[-1]
+                return {"last_end": last["end"], "window": w_int, "approximate": False}
+        return None
+
+    async def _find_files_range(self, channel: int, day: date_cls, start_dt: datetime | None, end_dt: datetime | None):
+        # similar to _find_files but clamp to range and cap pages
+        object_id = await self._create_finder()
+        try:
+            day_text = day.isoformat()
+            status_text = await self._get(
+                "/cgi-bin/mediaFileFind.cgi",
+                [
+                    ("action", "findFile"),
+                    ("object", object_id),
+                    ("condition.Channel", str(channel)),
+                    ("condition.StartTime", f"{day_text} 00:00:00"),
+                    ("condition.EndTime", f"{day_text} 23:59:59"),
+                ],
+                "findFile",
+            )
+            first_line = status_text.strip().splitlines()[0:1]
+            first = first_line[0].strip() if first_line else ""
+            if not first.upper().startswith("OK"):
+                return {"available": False, "reason": _safe_reason(status_text), "files": [], "truncated": False}
+            files, truncated = await self._read_pages_capped(object_id, channel, "Main", day, 5)
+            # clamp
+            out = []
+            for f in files:
+                try:
+                    st = datetime.strptime(f["start"], _TIME_FORMAT)
+                    et = datetime.strptime(f["end"], _TIME_FORMAT)
+                except Exception:
+                    continue
+                if start_dt and et < start_dt:
+                    continue
+                if end_dt and st > end_dt:
+                    continue
+                out.append(f)
+            out.sort(key=lambda item: item["start"])
+            return {"available": True, "files": out, "truncated": truncated}
+        finally:
+            await self._finish_finder(object_id)
+
+    async def _read_pages_capped(self, object_id: str, channel: int, expected_stream: str, day: date_cls, max_pages: int):
+        files: list[dict[str, Any]] = []
+        expected_channel = channel + self._response_channel_offset
+        day_start = datetime.combine(day, time_cls.min)
+        day_end = datetime.combine(day, _DAY_END)
+        pages = 0
+        while pages < max_pages:
+            text = await self._get(
+                "/cgi-bin/mediaFileFind.cgi",
+                [
+                    ("action", "findNextFile"),
+                    ("object", object_id),
+                    ("count", str(_PAGE_SIZE)),
+                ],
+                "findNextFile",
+            )
+            pages += 1
+            found_match = _FOUND_RE.search(text)
+            if not found_match:
+                raise CgiError("The DVR returned an unexpected recordings page.")
+            found = int(found_match.group(1))
+            items = _parse_items(text)
+            for index in sorted(items):
+                item = items[index]
+                if not _matches_item(item, expected_channel, expected_stream):
+                    continue
+                file = _file_from_item(item, day_start, day_end)
+                if file is not None:
+                    files.append(file)
+            if found < _PAGE_SIZE:
+                return files, False
+        return files, True

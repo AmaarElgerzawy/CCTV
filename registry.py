@@ -14,6 +14,7 @@ import asyncio
 import csv
 import io
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -62,6 +63,7 @@ CSV_COLUMNS = (
 _DEFAULT_USERNAME_KEY = "default_username"
 _DEFAULT_PASSWORD_KEY = "default_password_enc"
 _MIGRATION_KEY = "first_run_migration"
+_HEALTH_SCHEMA_MIGRATION_KEY = "health_schema_migrated"
 _HOSTNAME_LABEL = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
 _DIGITS_AND_DOTS = re.compile(r"^[0-9.]+$")
 
@@ -252,7 +254,48 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _parse_unused_channels(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        out = []
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                v = int(part)
+            except ValueError:
+                continue
+            if v >= 1:
+                out.append(v)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        out = []
+        for part in value:
+            try:
+                v = int(part)
+            except (TypeError, ValueError):
+                continue
+            if v >= 1:
+                out.append(v)
+        return out
+    return []
+
+
 def _device_public(row: sqlite3.Row) -> dict[str, Any]:
+    unused = _parse_unused_channels(row["unused_channels"] if "unused_channels" in row.keys() else "")
+    stale_hours = row["stale_hours"] if "stale_hours" in row.keys() else None
+    try:
+        if stale_hours is not None and stale_hours != "":
+            stale_hours = int(stale_hours)
+        else:
+            stale_hours = None
+    except (TypeError, ValueError):
+        stale_hours = None
     return {
         "id": row["id"],
         "name": row["name"],
@@ -265,6 +308,8 @@ def _device_public(row: sqlite3.Row) -> dict[str, Any]:
             row["username"] and row["password_enc"]
         ),
         "notes": row["notes"] or "",
+        "unused_channels": unused,
+        "stale_hours": stale_hours,
     }
 
 
@@ -424,11 +469,49 @@ class DeviceRegistry:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS device_health (
+                    device_id INTEGER PRIMARY KEY REFERENCES devices(id)
+                        ON DELETE CASCADE,
+                    checked_at TEXT,
+                    state TEXT,
+                    storage_state TEXT,
+                    storage_disks TEXT,
+                    storage_errors TEXT,
+                    device_time TEXT,
+                    error_class TEXT,
+                    channels_json TEXT
+                );
                 """
             )
+        self._migrate_health_schema()
         if os.name != "nt":
             with suppress(OSError):
                 os.chmod(self._db_path, 0o600)
+
+    def _migrate_health_schema(self) -> None:
+        with self._db() as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(devices)").fetchall()}
+            if "unused_channels" not in cols:
+                conn.execute("ALTER TABLE devices ADD COLUMN unused_channels TEXT DEFAULT ''")
+            if "stale_hours" not in cols:
+                conn.execute("ALTER TABLE devices ADD COLUMN stale_hours INTEGER")
+            # ensure table exists
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS device_health (
+                    device_id INTEGER PRIMARY KEY REFERENCES devices(id)
+                        ON DELETE CASCADE,
+                    checked_at TEXT,
+                    state TEXT,
+                    storage_state TEXT,
+                    storage_disks TEXT,
+                    storage_errors TEXT,
+                    device_time TEXT,
+                    error_class TEXT,
+                    channels_json TEXT
+                );
+                """
+            )
 
     def _migrate_first_run(self) -> None:
         """Create one device from DVR_* once, without logging the values."""
@@ -885,12 +968,37 @@ class DeviceRegistry:
                 http_port=http_port,
                 device_id=device_id,
             )
+            unused_channels = existing["unused_channels"] if "unused_channels" in existing.keys() else ""
+            stale_hours = existing["stale_hours"] if "stale_hours" in existing.keys() else None
+            if "unused_channels" in body:
+                parsed = _parse_unused_channels(body["unused_channels"])
+                out = []
+                seen = set()
+                for v in parsed:
+                    if v in seen:
+                        continue
+                    seen.add(v)
+                    out.append(v)
+                unused_channels = ",".join(str(x) for x in sorted(out))
+            if "stale_hours" in body:
+                shv = body["stale_hours"]
+                if shv is None:
+                    stale_hours = None
+                else:
+                    try:
+                        sh = int(shv)
+                    except (TypeError, ValueError):
+                        raise RegistryError("stale_hours must be an integer between 1 and 720 or null.")
+                    if sh < 1 or sh > 720:
+                        raise RegistryError("stale_hours must be an integer between 1 and 720 or null.")
+                    stale_hours = sh
             conn.execute(
                 """
                 UPDATE devices SET
                     name = ?, group_id = ?, host = ?, http_port = ?,
                     rtsp_port = ?, username = ?, password_enc = ?,
-                    notes = ?
+                    notes = ?,
+                    unused_channels = ?, stale_hours = ?
                 WHERE id = ?
                 """,
                 (
@@ -902,6 +1010,8 @@ class DeviceRegistry:
                     username,
                     password_enc,
                     notes,
+                    unused_channels if unused_channels is not None else "",
+                    stale_hours,
                     device_id,
                 ),
             )
@@ -1452,3 +1562,86 @@ class StatusChecker:
             "checked_at": _iso(self._clock()),
             "devices": devices,
         }
+
+
+    def get_all_devices(self) -> list[dict[str, Any]]:
+        return self.list_devices()
+
+    def get_device_health(self, device_id: int) -> dict[str, Any] | None:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM device_health WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        res = dict(row)
+        try:
+            if res.get("channels_json"):
+                res["channels"] = json.loads(res["channels_json"])
+            else:
+                res["channels"] = []
+        except Exception:
+            res["channels"] = []
+        res.pop("channels_json", None)
+        if res.get("storage_disks"):
+            try:
+                res["storage_disks"] = json.loads(res["storage_disks"])
+            except Exception:
+                pass
+        return res
+
+    def get_all_health(self) -> dict[int, dict[str, Any]]:
+        out: dict[int, dict[str, Any]] = {}
+        with self._db() as conn:
+            rows = conn.execute("SELECT * FROM device_health").fetchall()
+        for row in rows:
+            res = dict(row)
+            try:
+                if res.get("channels_json"):
+                    res["channels"] = json.loads(res["channels_json"])
+                else:
+                    res["channels"] = []
+            except Exception:
+                res["channels"] = []
+            res.pop("channels_json", None)
+            if res.get("storage_disks"):
+                try:
+                    res["storage_disks"] = json.loads(res["storage_disks"])
+                except Exception:
+                    pass
+            out[res["device_id"]] = res
+        return out
+
+    def save_health(self, device_id: int, data: dict[str, Any]) -> None:
+        channels_json = json.dumps(data.get("channels") or [])
+        storage_disks = json.dumps(data.get("storage_disks") or [])
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO device_health
+                    (device_id, checked_at, state, storage_state, storage_disks,
+                     storage_errors, device_time, error_class, channels_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(device_id) DO UPDATE SET
+                    checked_at = excluded.checked_at,
+                    state = excluded.state,
+                    storage_state = excluded.storage_state,
+                    storage_disks = excluded.storage_disks,
+                    storage_errors = excluded.storage_errors,
+                    device_time = excluded.device_time,
+                    error_class = excluded.error_class,
+                    channels_json = excluded.channels_json
+                """,
+                (
+                    device_id,
+                    data.get("checked_at"),
+                    data.get("state"),
+                    data.get("storage_state"),
+                    storage_disks,
+                    data.get("storage_errors"),
+                    data.get("device_time"),
+                    data.get("error_class"),
+                    channels_json,
+                ),
+            )

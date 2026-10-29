@@ -39,6 +39,8 @@ const deviceUsername = document.getElementById("device-username");
 const devicePassword = document.getElementById("device-password");
 const deviceClearCreds = document.getElementById("device-clear-creds");
 const deviceNotes = document.getElementById("device-notes");
+const deviceUnusedChannels = document.getElementById("device-unused-channels");
+const deviceStaleHours = document.getElementById("device-stale-hours");
 const formNote = document.getElementById("form-note");
 const deviceSave = document.getElementById("device-save");
 
@@ -416,6 +418,8 @@ function resetForm() {
   deviceRtspPort.value = "554";
   deviceGroup.value = "";
   deviceClearCreds.checked = false;
+  if (deviceUnusedChannels) deviceUnusedChannels.value = "";
+  if (deviceStaleHours) deviceStaleHours.value = "";
   formNote.className = "section-note registry-wide";
   formNote.textContent =
     "A device with no username and password uses the default credentials.";
@@ -435,6 +439,13 @@ function beginEdit(device) {
   devicePassword.value = "";
   deviceClearCreds.checked = false;
   deviceNotes.value = device.notes || "";
+  if (deviceUnusedChannels) {
+    if (Array.isArray(device.unused_channels)) deviceUnusedChannels.value = device.unused_channels.join(",");
+    else deviceUnusedChannels.value = "";
+  }
+  if (deviceStaleHours) {
+    deviceStaleHours.value = device.stale_hours == null ? "" : String(device.stale_hours);
+  }
   formNote.className = "section-note registry-wide";
   formNote.textContent = device.has_own_credentials
     ? "This device has its own credentials. Leave both fields empty to " +
@@ -669,6 +680,14 @@ deviceForm.addEventListener("submit", async (event) => {
     rtsp_port: Number(deviceRtspPort.value),
     notes: deviceNotes.value,
   };
+  if (deviceUnusedChannels) {
+    payload.unused_channels = deviceUnusedChannels.value;
+  }
+  if (deviceStaleHours) {
+    const v = deviceStaleHours.value.trim();
+    if (v === "") payload.stale_hours = null;
+    else payload.stale_hours = Number(v);
+  }
   payload.group_id = deviceGroup.value
     ? Number(deviceGroup.value)
     : null;
