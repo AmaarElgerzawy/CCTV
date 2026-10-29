@@ -86,9 +86,21 @@ async function load() {
     sumUnknown.textContent = summary.unknown ?? 0;
     window._last = data;
     render(data);
-    setStatus("ok", "Loaded");
+    const round = data.round || {};
+    if (round.running) {
+      const n = round.checked || 0;
+      const m = round.total || 0;
+      setStatus("warn", `Check running: ${n} of ${m}`);
+      if (checkAllBtn) { checkAllBtn.disabled = true; checkAllBtn.textContent = "Checking…"; }
+    } else {
+      if (checkAllBtn) { checkAllBtn.disabled = false; checkAllBtn.textContent = "Check all (slow)"; }
+      setStatus("ok", "Loaded");
+    }
   } catch (e) {
     setStatus("error", e.message);
+    healthList.replaceChildren();
+    healthNote.textContent = e.message;
+    if (checkAllBtn) { checkAllBtn.disabled = false; checkAllBtn.textContent = "Check all (slow)"; }
   }
 }
 
@@ -110,7 +122,6 @@ function render(data) {
     }
     return true;
   });
-  // sort problems first
   filtered.sort((a,b) => {
     const sa = (a.health||{}).state||"unknown";
     const sb = (b.health||{}).state||"unknown";
@@ -120,7 +131,12 @@ function render(data) {
   });
   healthList.replaceChildren();
   if (filtered.length === 0) {
-    healthNote.textContent = "No devices.";
+    // check if there are any devices at all
+    if (!items || items.length === 0) {
+      healthNote.textContent = "No devices registered yet";
+    } else {
+      healthNote.textContent = "No devices match filters.";
+    }
     return;
   }
   healthNote.textContent = "";
@@ -159,7 +175,8 @@ function row(it) {
   name.textContent = d.name || "—";
   const meta = document.createElement("span");
   meta.className = "muted";
-  meta.textContent = ` ${d.host||""}:${d.http_port||""} · checked ${timeAgo(h.checked_at)}`;
+  const checked = h.checked_at ? timeAgo(h.checked_at) : "never checked";
+  meta.textContent = ` ${d.host||""}:${d.http_port||""} · checked ${checked}`;
   left.append(name, document.createElement("br"), meta);
   const badges = document.createElement("div");
   const bs = document.createElement("span");
@@ -199,10 +216,10 @@ checkAllBtn.onclick = async () => {
   try {
     await requestJson("/api/health/check-all", {method:"POST"});
     setStatus("ok", "Check all started");
+    setTimeout(load, 500);
   } catch(e) {
-    if (e.message && e.message.includes("already")) setStatus("warn", e.message);
+    if (e.message && (e.message.includes("already") || e.message.includes("running"))) setStatus("warn", e.message);
     else setStatus("error", e.message);
-  } finally {
     checkAllBtn.disabled = false;
   }
 };

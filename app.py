@@ -99,6 +99,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     reaper: asyncio.Task[None] | None = None
     registry: DeviceRegistry | None = None
     checker: StatusChecker | None = None
+    health_sched_task: asyncio.Task[None] | None = None
 
     try:
         registry_settings = RegistrySettings.from_env(BASE_DIR)
@@ -141,8 +142,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         checker.start()
 
     try:
+        health_sched_task = asyncio.create_task(_health_scheduler())
+    except Exception:
+        health_sched_task = None
+
+    try:
         yield
     finally:
+        if health_sched_task is not None:
+            health_sched_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await health_sched_task
         if checker is not None:
             with suppress(asyncio.CancelledError):
                 await checker.stop()
@@ -1169,6 +1179,7 @@ _HEALTH_CHECK_LOCKS_GUARD = asyncio.Lock()
 _HEALTH_LAST_CHECK: dict[int, float] = {}
 _HEALTH_ROUND_TASK: asyncio.Task | None = None
 _HEALTH_ROUND_LOCK = asyncio.Lock()
+_HEALTH_ROUND_META = {"running": False, "started_at": None, "finished_at": None, "checked": 0, "total": 0}
 
 
 async def _health_check_lock(device_id: int) -> asyncio.Lock:
@@ -1217,22 +1228,46 @@ def _status_cache_getter(device_id: int):
 async def _run_health_round() -> None:
     registry = getattr(app.state, "registry", None)
     if registry is None or check_device is None:
+        _HEALTH_ROUND_META["running"] = False
+        _HEALTH_ROUND_META["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return
+    # ensure tcp status is fresh if cache empty
+    checker = getattr(app.state, "status_checker", None)
+    try:
+        if checker is not None and hasattr(checker, "snapshot"):
+            snap = checker.snapshot()
+            devs_snap = snap.get("devices") if isinstance(snap, dict) else None
+            if not devs_snap:
+                try:
+                    if hasattr(checker, "run_once"):
+                        await checker.run_once()
+                except Exception:
+                    pass
+    except Exception:
+        pass
     try:
         devices = registry.get_all_devices()
     except Exception:
         devices = []
     to_check = []
     for d in devices:
+        did = d.get("id") if isinstance(d, dict) else None
+        if did is None:
+            continue
         try:
-            st = _status_cache_getter(d.get("id"))
+            st = _status_cache_getter(did)
             if st and isinstance(st, dict):
                 sst = st.get("state")
                 if sst in ("offline",):
                     continue  # skip offline
-            to_check.append(d.get("id"))
+            to_check.append(did)
         except Exception:
             continue
+    _HEALTH_ROUND_META["running"] = True
+    _HEALTH_ROUND_META["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _HEALTH_ROUND_META["finished_at"] = None
+    _HEALTH_ROUND_META["total"] = len(to_check)
+    _HEALTH_ROUND_META["checked"] = 0
     conc = _deep_check_concurrency()
     sem = asyncio.Semaphore(conc)
     interval = 1.0
@@ -1247,6 +1282,7 @@ async def _run_health_round() -> None:
                 return  # skip if busy
             try:
                 await check_device(registry, did, _status_cache_getter)
+                _HEALTH_ROUND_META["checked"] += 1
             finally:
                 try:
                     lock.release()
@@ -1260,6 +1296,8 @@ async def _run_health_round() -> None:
         tasks.append(asyncio.create_task(worker(int(did))))
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+    _HEALTH_ROUND_META["running"] = False
+    _HEALTH_ROUND_META["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 async def _health_scheduler() -> None:
@@ -1299,41 +1337,45 @@ async def status_page() -> FileResponse:
 async def api_health() -> JSONResponse:
     registry = getattr(app.state, "registry", None)
     if registry is None:
-        return JSONResponse({"devices": [], "summary": {"ok": 0, "stale": 0, "problems": 0, "offline": 0, "unknown": 0}})
+        return JSONResponse({"devices": [], "summary": {"ok": 0, "stale": 0, "problems": 0, "offline": 0, "unknown": 0}, "round": dict(_HEALTH_ROUND_META)})
     try:
         health_all = registry.get_all_health()
         devices = registry.get_all_devices()
     except Exception:
         health_all = {}
         devices = []
-    # enrich with device info
     out_devices = []
     summary = {"ok": 0, "stale": 0, "problems": 0, "offline": 0, "unknown": 0}
     for d in devices:
+        if not isinstance(d, dict):
+            continue
         did = d.get("id")
         h = health_all.get(did) if did is not None else None
+        if not h or not isinstance(h, dict):
+            h = {"state": "unknown", "checked_at": None, "channels": []}
         item = {
             "device": d,
             "health": h,
         }
         out_devices.append(item)
-        if h and isinstance(h, dict):
-            st = h.get("state")
+        if isinstance(h, dict):
+            st = h.get("state") or "unknown"
             if st == "ok":
                 summary["ok"] += 1
             elif st == "stale":
                 summary["stale"] += 1
             elif st in ("offline", "auth_failed", "unreachable", "storage_problem", "unavailable"):
-                # problems bucket
                 if st == "offline":
                     summary["offline"] += 1
                 else:
                     summary["problems"] += 1
+            elif st == "unknown":
+                summary["unknown"] += 1
             else:
                 summary["unknown"] += 1
         else:
             summary["unknown"] += 1
-    return JSONResponse({"devices": out_devices, "summary": summary})
+    return JSONResponse({"devices": out_devices, "summary": summary, "round": dict(_HEALTH_ROUND_META)})
 
 
 @app.post("/api/devices/{device_id}/health/check")
@@ -1355,27 +1397,51 @@ async def api_device_health_check(device_id: int) -> JSONResponse:
         _HEALTH_LAST_CHECK[device_id] = time.time()
         return JSONResponse(res)
     finally:
-        lock.release()
+        try:
+            lock.release()
+        except Exception:
+            pass
 
 
 @app.post("/api/health/check-all")
 async def api_health_check_all() -> JSONResponse:
     global _HEALTH_ROUND_TASK
+    # ensure tcp status fresh if empty
+    registry = getattr(app.state, "registry", None)
+    checker = getattr(app.state, "status_checker", None)
+    try:
+        if checker is not None and hasattr(checker, "snapshot"):
+            snap = checker.snapshot()
+            devs_snap = snap.get("devices") if isinstance(snap, dict) else None
+            if not devs_snap:
+                try:
+                    if hasattr(checker, "run_once"):
+                        await checker.run_once()
+                except Exception:
+                    pass
+    except Exception:
+        pass
     async with _HEALTH_ROUND_LOCK:
         cur = _HEALTH_ROUND_TASK
         if cur is not None and not cur.done():
-            return JSONResponse({"error": "already_running"}, status_code=409)
+            return JSONResponse({"running": True}, status_code=409)
+        # count target devices
+        targets = 0
+        try:
+            if registry is not None:
+                devs = registry.get_all_devices()
+                for d in devs:
+                    did = d.get("id") if isinstance(d, dict) else None
+                    if did is None:
+                        continue
+                    st = _status_cache_getter(did)
+                    if st and isinstance(st, dict) and st.get("state") == "offline":
+                        continue
+                    targets += 1
+        except Exception:
+            targets = 0
         _HEALTH_ROUND_TASK = asyncio.create_task(_run_health_round())
-    return JSONResponse({"status": "started"}, status_code=202)
+    return JSONResponse({"started": True, "devices": targets}, status_code=202)
 
 
-# start scheduler (best effort)
-_HEALTH_SCHED_TASK = None
-try:
-    loop = asyncio.get_running_loop()
-    _HEALTH_SCHED_TASK = loop.create_task(_health_scheduler())
-except Exception:
-    try:
-        _HEALTH_SCHED_TASK = asyncio.create_task(_health_scheduler())
-    except Exception:
-        _HEALTH_SCHED_TASK = None
+# start scheduler is handled in lifespan
